@@ -429,7 +429,7 @@ def digitize():
 
             valid = []
             for c in contours:
-                if cv2.contourArea(c) < 200:
+                if cv2.contourArea(c) < 50:
                     continue
                 _, _, cw, ch = cv2.boundingRect(c)
                 if cw < MIN_BBOX_PX or ch < MIN_BBOX_PX:
