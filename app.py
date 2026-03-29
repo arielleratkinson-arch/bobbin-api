@@ -406,8 +406,8 @@ def digitize():
         img_rgb = np.array(pil_img, dtype=np.uint8)
         img_h, img_w = img_rgb.shape[:2]
 
-        # Bilateral filter — reduces noise while preserving edges
-        img_filtered = cv2.bilateralFilter(img_rgb, d=9, sigmaColor=100, sigmaSpace=100)
+        # Bilateral filter — d=5 preserves fine stripe / line details better than d=9
+        img_filtered = cv2.bilateralFilter(img_rgb, d=5, sigmaColor=100, sigmaSpace=100)
 
         # ── 2. K-means color clustering ────────────────────────────────────────
         k = min(16, max(2, color_count_param))
@@ -467,7 +467,7 @@ def digitize():
         TATAMI_ROW_U = 5    # 0.5 mm tatami row spacing
         STITCH_2MM   = 20   # 2 mm running-stitch spacing
         STITCH_4MM   = 40   # 4 mm tatami stitch length
-        MIN_SHAPE_U  = 30   # 3 mm minimum shape bbox side (in emb units)
+        MIN_SHAPE_U  = 8    # 0.8 mm minimum shape bbox side — low enough to catch thin 'I'/'E'
 
         # ── 5. Contour collection with min-area retry ──────────────────────────
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -494,7 +494,7 @@ def digitize():
 
         color_contours = None
         found_any      = False
-        for min_area in [200, 50, 10]:
+        for min_area in [200, 50, 10, 8]:
             cc = _collect(min_area)
             if cc:
                 found_any = True
@@ -652,10 +652,11 @@ def digitize():
             pattern.add_thread(thread)
 
             if not first_thread:
+                # COLOR_CHANGE signals a thread swap; TRIM cuts cleanly before the new color
                 pattern.add_stitch_absolute(pyembroidery.COLOR_CHANGE, 0, 0)
+                pattern.add_stitch_absolute(pyembroidery.TRIM, 0, 0)
             first_thread = False
 
-            color_first = True
             for contour in color_contours[cidx]:
                 # Optional contour simplification
                 if do_simplify:
@@ -686,7 +687,7 @@ def digitize():
                 #   Building outline     → fill_density ~0.15  → running outline
                 #   Text letters         → fill_density ~0.30  → running outline
                 #
-                # Threshold: > 0.5 → fill,  ≤ 0.5 → outline only
+                # Threshold: > 0.4 → fill,  ≤ 0.4 → outline only
                 c_mask = np.zeros((img_h, img_w), dtype=np.uint8)
                 cv2.drawContours(c_mask, [contour], -1, 255, thickness=cv2.FILLED)
                 contour_px_area = int(np.count_nonzero(c_mask))
@@ -697,7 +698,7 @@ def digitize():
                 else:
                     fill_density = 1.0          # degenerate contour — default to fill
 
-                is_hollow = fill_density <= 0.5
+                is_hollow = fill_density <= 0.4
                 print(
                     f"DIGITIZE: contour {c_w_emb/10:.1f}×{c_h_emb/10:.1f}mm "
                     f"fill_density={fill_density:.2f} → "
@@ -708,9 +709,8 @@ def digitize():
                 start = emb_pts[0]
                 end   = emb_pts[-1]
 
-                if not color_first:
-                    pattern.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
-                color_first = False
+                # Always TRIM before moving to this contour's start — eliminates jump lines
+                pattern.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
 
                 tie_on(pattern, start[0], start[1])
 
