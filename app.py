@@ -386,7 +386,7 @@ def digitize():
 
     try:
         # ── 1. Load image & quantize to color_count colors ────────────────────
-        pil_img = Image.open(tmp_in)
+        pil_img_raw = Image.open(tmp_in) if pil_img_raw.mode == 'RGBA':     background = Image.new('RGB', pil_img_raw.size, (255, 255, 255))     background.paste(pil_img_raw, mask=pil_img_raw.split()[3])     pil_img = background else:     pil_img = pil_img_raw.convert('RGB')
         orig_w, orig_h = pil_img.size
 
         # Special case: color_count == 2 → black and white
