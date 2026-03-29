@@ -407,7 +407,7 @@ def digitize():
         img_h, img_w = img_rgb.shape[:2]
 
         # Bilateral filter — reduces noise while preserving edges
-        img_filtered = cv2.bilateralFilter(img_rgb, d=9, sigmaColor=75, sigmaSpace=75)
+        img_filtered = cv2.bilateralFilter(img_rgb, d=9, sigmaColor=100, sigmaSpace=100)
 
         # ── 2. K-means color clustering ────────────────────────────────────────
         k = min(16, max(2, color_count_param))
@@ -432,9 +432,11 @@ def digitize():
         # ── 4. Hoop constants  (1 pyembroidery unit = 0.1 mm) ─────────────────
         hoop_w_u = hoop_width_mm  * 10
         hoop_h_u = hoop_height_mm * 10
-        ROW_U      = 4    # 0.4 mm row spacing
-        STITCH_2MM = 20   # 2 mm running-stitch spacing
-        STITCH_4MM = 40   # 4 mm tatami stitch length
+        SATIN_ROW_U  = 5    # 0.5 mm satin row spacing  (~0.45 mm, nearest integer unit)
+        TATAMI_ROW_U = 5    # 0.5 mm tatami row spacing
+        STITCH_2MM   = 20   # 2 mm running-stitch spacing
+        STITCH_4MM   = 40   # 4 mm tatami stitch length
+        MIN_SHAPE_U  = 30   # 3 mm minimum shape bbox side (in emb units)
 
         # ── 5. Contour collection with min-area retry ──────────────────────────
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -532,66 +534,76 @@ def digitize():
                     pat.add_stitch_absolute(pyembroidery.STITCH, pt[0], pt[1])
                 prev = pt
 
-        def satin_fill(pat, xs_e, ys_e, row_u=ROW_U):
-            """Horizontal satin rows across the bounding box, alternating direction."""
+        def emb_to_px_f(ex, ey):
+            """Convert embroidery units to floating-point pixel coords for polygon tests."""
+            return (
+                (ex - off_x) / scale + px_min_x,
+                (ey - off_y) / scale + px_min_y,
+            )
+
+        def satin_fill(pat, contour, xs_e, ys_e, row_u=SATIN_ROW_U):
+            """Satin rows clipped to the actual contour via pointPolygonTest.
+            Finds the true left/right edge of the shape at each row."""
             mn_x, mx_x = min(xs_e), max(xs_e)
             mn_y, mx_y = min(ys_e), max(ys_e)
+            contour_f   = contour.astype(np.float32)
             toggle = True
-            y = mn_y
-            while y <= mx_y:
-                if toggle:
-                    pat.add_stitch_absolute(pyembroidery.STITCH, mn_x, y)
-                    pat.add_stitch_absolute(pyembroidery.STITCH, mx_x, y)
-                else:
-                    pat.add_stitch_absolute(pyembroidery.STITCH, mx_x, y)
-                    pat.add_stitch_absolute(pyembroidery.STITCH, mn_x, y)
-                y      += row_u
-                toggle  = not toggle
+            y_e = mn_y
+            while y_e <= mx_y:
+                _, py = emb_to_px_f(mn_x, y_e)
+                # Scan left→right for first inside point
+                left_x = None
+                x_e = mn_x
+                while x_e <= mx_x:
+                    px_t, _ = emb_to_px_f(x_e, y_e)
+                    if cv2.pointPolygonTest(contour_f, (float(px_t), float(py)), False) >= 0:
+                        left_x = x_e
+                        break
+                    x_e += 1
+                # Scan right→left for last inside point
+                right_x = None
+                x_e = mx_x
+                while x_e >= mn_x:
+                    px_t, _ = emb_to_px_f(x_e, y_e)
+                    if cv2.pointPolygonTest(contour_f, (float(px_t), float(py)), False) >= 0:
+                        right_x = x_e
+                        break
+                    x_e -= 1
+                if left_x is not None and right_x is not None and right_x >= left_x:
+                    if toggle:
+                        pat.add_stitch_absolute(pyembroidery.STITCH, left_x,  y_e)
+                        pat.add_stitch_absolute(pyembroidery.STITCH, right_x, y_e)
+                    else:
+                        pat.add_stitch_absolute(pyembroidery.STITCH, right_x, y_e)
+                        pat.add_stitch_absolute(pyembroidery.STITCH, left_x,  y_e)
+                y_e   += row_u
+                toggle = not toggle
 
-        def tatami_fill(pat, contour, row_u=ROW_U, stitch_u=STITCH_4MM):
-            """Tatami fill clipped to the actual contour mask — no overflow outside shape."""
+        def tatami_fill(pat, contour, row_u=TATAMI_ROW_U, stitch_u=STITCH_4MM):
+            """Tatami fill clipped to the actual contour shape via pointPolygonTest.
+            Each candidate stitch point is tested before being emitted."""
             bx, by, bw, bh = cv2.boundingRect(contour)
             if bw < 1 or bh < 1:
                 return
-            # Pixel-space filled mask for this contour only
-            filled = np.zeros((img_h, img_w), dtype=np.uint8)
-            cv2.drawContours(filled, [contour], 0, 255, thickness=cv2.FILLED)
+            contour_f = contour.astype(np.float32)
 
-            # Emb Y range derived from contour corners
             e_top    = px_to_emb(bx,      by)
             e_bottom = px_to_emb(bx + bw, by + bh)
             e_y_min  = min(e_top[1], e_bottom[1])
             e_y_max  = max(e_top[1], e_bottom[1])
+            e_x_min  = min(e_top[0], e_bottom[0])
+            e_x_max  = max(e_top[0], e_bottom[0])
 
             row = 0
             y_e = e_y_min
             while y_e <= e_y_max:
-                # Map emb Y back to nearest pixel row for mask sampling
-                py = max(0, min(img_h - 1, int(round((y_e - off_y) / scale + px_min_y))))
-
                 row_offset = (stitch_u // 2) if row % 2 == 1 else 0
-
-                # Scan pixel columns in contour bbox, emit runs of filled pixels
-                in_run = False
-                run_sx = None
-                for i in range(bw + 1):
-                    pxi = bx + i
-                    on  = (i < bw) and (filled[py, pxi] > 0)
-                    if on and not in_run:
-                        in_run = True
-                        run_sx = pxi
-                    elif not on and in_run:
-                        in_run  = False
-                        run_ex  = pxi - 1
-                        ex_s, _ = px_to_emb(run_sx, py)
-                        ex_e, _ = px_to_emb(run_ex, py)
-                        if ex_s > ex_e:
-                            ex_s, ex_e = ex_e, ex_s
-                        x = ex_s + row_offset
-                        while x <= ex_e:
-                            pat.add_stitch_absolute(pyembroidery.STITCH, x, y_e)
-                            x += stitch_u
-
+                x = e_x_min + row_offset
+                while x <= e_x_max:
+                    px_t, py_t = emb_to_px_f(x, y_e)
+                    if cv2.pointPolygonTest(contour_f, (float(px_t), float(py_t)), False) >= 0:
+                        pat.add_stitch_absolute(pyembroidery.STITCH, x, y_e)
+                    x += stitch_u
                 y_e += row_u
                 row += 1
 
@@ -626,8 +638,14 @@ def digitize():
 
                 xs_e = [p[0] for p in emb_pts]
                 ys_e = [p[1] for p in emb_pts]
-                _, _, c_w_px, _ = cv2.boundingRect(contour)
-                c_w_mm = px_w_to_mm(c_w_px)
+                _, _, c_w_px, c_h_px = cv2.boundingRect(contour)
+                c_w_mm  = px_w_to_mm(c_w_px)
+
+                # ── Min-shape filter: skip tiny noise shapes < 3mm × 3mm ──────
+                c_w_emb = c_w_px * scale
+                c_h_emb = c_h_px * scale
+                if c_w_emb < MIN_SHAPE_U or c_h_emb < MIN_SHAPE_U:
+                    continue
 
                 start = emb_pts[0]
                 end   = emb_pts[-1]
@@ -643,16 +661,16 @@ def digitize():
                     running_outline(pattern, contour, stitch_u=STITCH_2MM)
 
                 elif stitch_type == "satin" or (stitch_type == "auto" and c_w_mm < 8.0):
-                    # ── Medium: underlay running → satin, 0.4 mm rows ─────────
+                    # ── Medium: underlay running → satin, 0.5 mm rows ─────────
                     running_outline(pattern, contour, stitch_u=STITCH_2MM)
                     pattern.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
-                    satin_fill(pattern, xs_e, ys_e, row_u=ROW_U)
+                    satin_fill(pattern, contour, xs_e, ys_e, row_u=SATIN_ROW_U)
 
                 else:
-                    # ── Large: underlay running → tatami fill, 0.4 mm rows ────
+                    # ── Large: underlay running → tatami fill, 0.5 mm rows ────
                     running_outline(pattern, contour, stitch_u=STITCH_2MM)
                     pattern.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
-                    tatami_fill(pattern, contour, row_u=ROW_U, stitch_u=STITCH_4MM)
+                    tatami_fill(pattern, contour, row_u=TATAMI_ROW_U, stitch_u=STITCH_4MM)
 
                 tie_off(pattern, end[0], end[1])
                 any_stitches = True
