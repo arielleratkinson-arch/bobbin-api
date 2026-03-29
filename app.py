@@ -593,8 +593,7 @@ def digitize():
                 out_w = max(vxs) - min(vxs)
                 out_h = max(vys) - min(vys)
                 if out_w < 10 or out_h < 10:
-                    return jsonify({"error": "Scaling error — design produced at incorrect size"}), 500
-
+                    return jsonify({"error": "Image too complex — try a simpler image with clearer edges"}), 400
         info = get_design_info(pattern)
         mime = MIME_TYPES.get(output_format, "application/octet-stream")
         response = send_file(tmp_out.name, mimetype=mime, as_attachment=True,
