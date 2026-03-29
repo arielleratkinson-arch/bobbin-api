@@ -372,7 +372,7 @@ def digitize():
     max_stitch_length = float(request.form.get("max_stitch_length", 4.0))   # updated default
     min_stitch_length = float(request.form.get("min_stitch_length", 1.5))
     density = float(request.form.get("density", 3.0))                        # updated default
-    color_count_param = min(16, max(1, int(request.form.get("color_count", 6))))
+    color_count_param = min(16, max(1, int(request.form.get("color_count", 8))))
     do_simplify = request.form.get("simplify", "true").lower() not in ("false", "0", "no")
 
     allowed_image_ext = [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"]
@@ -419,15 +419,46 @@ def digitize():
         centers   = np.uint8(centers)                              # k × 3 RGB
         labels_2d = labels_flat.flatten().reshape(img_h, img_w)   # pixel → cluster
 
-        # ── 3. Background detection (corner-vote) ──────────────────────────────
-        corner_votes = [
-            int(labels_2d[0, 0]),         int(labels_2d[0, img_w - 1]),
-            int(labels_2d[img_h - 1, 0]), int(labels_2d[img_h - 1, img_w - 1]),
-        ]
+        # ── 3. Background detection (edge-sampling) ────────────────────────────
+        # Sample 20 evenly-spaced pixels along each of the 4 edges (80 total).
+        # Any cluster appearing in > 30% of edge pixels is treated as background.
         from collections import Counter as _Counter
-        top_bg, top_freq = _Counter(corner_votes).most_common(1)[0]
-        bg_cluster = top_bg if top_freq >= 2 else None
-        print(f"DIGITIZE: k={k}  bg_cluster={bg_cluster}  image={img_w}×{img_h}px", flush=True)
+        _edge_samples = []
+        _n = 20
+        for _i in range(_n):
+            _t = int(_i * (img_w - 1) / max(_n - 1, 1))
+            _edge_samples.append(int(labels_2d[0,           _t]))        # top
+            _edge_samples.append(int(labels_2d[img_h - 1,  _t]))        # bottom
+        for _i in range(_n):
+            _t = int(_i * (img_h - 1) / max(_n - 1, 1))
+            _edge_samples.append(int(labels_2d[_t,          0]))         # left
+            _edge_samples.append(int(labels_2d[_t, img_w - 1]))         # right
+
+        _edge_total  = len(_edge_samples)
+        _edge_counts = _Counter(_edge_samples)
+        _threshold   = 0.30                                              # 30% of edge pixels
+        bg_clusters  = {cidx for cidx, cnt in _edge_counts.items()
+                        if cnt / _edge_total >= _threshold}
+
+        # Also exclude any K-means centre that is light (cream/beige/ivory/off-white):
+        # R > 220 AND G > 200 AND B > 180
+        _light_clusters = {
+            cidx for cidx in range(k)
+            if int(centers[cidx][0]) > 220
+            and int(centers[cidx][1]) > 200
+            and int(centers[cidx][2]) > 180
+        }
+        skip_clusters = bg_clusters | _light_clusters
+
+        # Keep the single legacy name for logging / backward compat
+        bg_cluster = next(iter(bg_clusters)) if len(bg_clusters) == 1 else (
+            _edge_counts.most_common(1)[0][0] if bg_clusters else None
+        )
+        print(
+            f"DIGITIZE: k={k}  bg_clusters={bg_clusters}  light_clusters={_light_clusters}"
+            f"  image={img_w}×{img_h}px",
+            flush=True,
+        )
 
         # ── 4. Hoop constants  (1 pyembroidery unit = 0.1 mm) ─────────────────
         hoop_w_u = hoop_width_mm  * 10
@@ -444,7 +475,7 @@ def digitize():
         def _collect(min_area):
             out = {}
             for cidx in range(k):
-                if cidx == bg_cluster:
+                if cidx in skip_clusters:
                     continue
                 mask = ((labels_2d == cidx).astype(np.uint8) * 255)
                 mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
