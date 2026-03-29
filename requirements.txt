@@ -1,0 +1,8 @@
+pyembroidery
+flask
+flask-cors
+opencv-python-headless
+Pillow
+numpy
+svgpathtools
+gunicorn
