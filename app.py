@@ -441,8 +441,8 @@ def digitize():
                 if cw < MIN_BBOX_PX or ch < MIN_BBOX_PX:
                     continue
                 if do_simplify:
-                    c = cv2.approxPolyDP(c, epsilon=2.0, closed=True)
-                if len(c) >= 2:
+                    c = cv2.approxPolyDP(c, epsilon=0.5, closed=True)
+                if len(c) >= 3:
                     valid.append(c)
 
             if valid:
