@@ -678,13 +678,32 @@ def digitize():
                 if c_w_emb < MIN_SHAPE_U or c_h_emb < MIN_SHAPE_U:
                     continue
 
-                # ── Oversized-region guard ─────────────────────────────────────
-                # A contour whose bbox covers > 30% of the hoop is almost certainly
-                # a large background region (building interior, text background, etc.)
-                # Force it to running-stitch outline only — never flood-fill it.
-                bbox_area_emb = c_w_emb * c_h_emb
-                hoop_area_emb = hoop_w_u * hoop_h_u
-                is_oversized  = bbox_area_emb > hoop_area_emb * 0.30
+                # ── Fill-density guard ─────────────────────────────────────────
+                # Count the actual cluster pixels that fall inside the contour
+                # boundary, divided by the total enclosed pixel area of the contour.
+                #
+                #   Solid star / circle  → fill_density ~0.95  → tatami fill
+                #   Building outline     → fill_density ~0.15  → running outline
+                #   Text letters         → fill_density ~0.30  → running outline
+                #
+                # Threshold: > 0.5 → fill,  ≤ 0.5 → outline only
+                c_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                cv2.drawContours(c_mask, [contour], -1, 255, thickness=cv2.FILLED)
+                contour_px_area = int(np.count_nonzero(c_mask))
+                if contour_px_area > 0:
+                    cluster_px    = (labels_2d == cidx).astype(np.uint8) * 255
+                    inside_px     = int(np.count_nonzero(cv2.bitwise_and(c_mask, cluster_px)))
+                    fill_density  = inside_px / contour_px_area
+                else:
+                    fill_density = 1.0          # degenerate contour — default to fill
+
+                is_hollow = fill_density <= 0.5
+                print(
+                    f"DIGITIZE: contour {c_w_emb/10:.1f}×{c_h_emb/10:.1f}mm "
+                    f"fill_density={fill_density:.2f} → "
+                    f"{'outline' if is_hollow else 'fill'}",
+                    flush=True,
+                )
 
                 start = emb_pts[0]
                 end   = emb_pts[-1]
@@ -695,11 +714,8 @@ def digitize():
 
                 tie_on(pattern, start[0], start[1])
 
-                if is_oversized or stitch_type == "running" or (stitch_type == "auto" and c_w_mm < 3.0):
-                    # ── Running outline: small/thin shapes OR oversized regions ─
-                    if is_oversized:
-                        print(f"DIGITIZE: oversized contour {c_w_emb/10:.1f}×{c_h_emb/10:.1f}mm "
-                              f"({bbox_area_emb/hoop_area_emb*100:.0f}% of hoop) → outline only", flush=True)
+                if is_hollow or stitch_type == "running" or (stitch_type == "auto" and c_w_mm < 3.0):
+                    # ── Running outline: small/thin shapes OR hollow fill-density ──
                     running_outline(pattern, contour, stitch_u=STITCH_2MM)
 
                 elif stitch_type == "satin" or (stitch_type == "auto" and c_w_mm < 8.0):
