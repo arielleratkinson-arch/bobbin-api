@@ -385,145 +385,227 @@ def digitize():
     tmp_out.close()
 
     try:
-        # ── 1. Load image & quantize to color_count colors ────────────────────
-        pil_img_raw = Image.open(tmp_in)
-        if pil_img_raw.mode == 'RGBA':
-            background = Image.new('RGB', pil_img_raw.size, (255, 255, 255))
-            background.paste(pil_img_raw, mask=pil_img_raw.split()[3])
-            pil_img = background
+        # ── 1. Preprocess image ────────────────────────────────────────────────
+        pil_img = Image.open(tmp_in)
+
+        # Flatten any transparency onto a white background
+        if pil_img.mode in ("RGBA", "LA", "PA"):
+            if pil_img.mode == "PA":
+                pil_img = pil_img.convert("RGBA")
+            white = Image.new("RGB", pil_img.size, (255, 255, 255))
+            white.paste(pil_img, mask=pil_img.split()[-1])
+            pil_img = white
+        elif pil_img.mode == "P" and "transparency" in pil_img.info:
+            pil_img = pil_img.convert("RGBA")
+            white = Image.new("RGB", pil_img.size, (255, 255, 255))
+            white.paste(pil_img, mask=pil_img.split()[-1])
+            pil_img = white
         else:
-            pil_img = pil_img_raw.convert('RGB')
-            orig_w, orig_h = pil_img.size
+            pil_img = pil_img.convert("RGB")
 
-        # Special case: color_count == 2 → black and white
-        if color_count_param == 2:
-            bw = pil_img.convert("L").point(lambda x: 0 if x < 128 else 255, "1")
-            bw_rgb = bw.convert("RGB")
-            palette_map = {0: (0, 0, 0), 255: (255, 255, 255)}
-            q_arr = np.array(bw.convert("L"), dtype=np.uint8)
-            q_arr = (q_arr > 128).astype(np.uint8) * 255
-            canonical_palette = {0: (0, 0, 0), 255: (255, 255, 255)}
-        else:
-            canonical_palette, q_arr = _quantize_colors(pil_img, color_count_param)
+        img_rgb = np.array(pil_img, dtype=np.uint8)
+        img_h, img_w = img_rgb.shape[:2]
 
-        # ── 2. Detect and exclude background ─────────────────────────────────
-        bg_idx = _detect_background(pil_img, q_arr)
+        # Bilateral filter — reduces noise while preserving edges
+        img_filtered = cv2.bilateralFilter(img_rgb, d=9, sigmaColor=75, sigmaSpace=75)
 
-        # ── 3. Hoop units and stitch settings ────────────────────────────────
-        hoop_w_units = hoop_width_mm * 10   # pyembroidery units = 1/10 mm
-        hoop_h_units = hoop_height_mm * 10
+        # ── 2. K-means color clustering ────────────────────────────────────────
+        k = min(16, max(2, color_count_param))
+        pixels = np.float32(img_filtered.reshape(-1, 3))
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0)
+        _, labels_flat, centers = cv2.kmeans(
+            pixels, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS
+        )
+        centers   = np.uint8(centers)                              # k × 3 RGB
+        labels_2d = labels_flat.flatten().reshape(img_h, img_w)   # pixel → cluster
 
-        max_stitch_units = max(1, int(max_stitch_length * 10))
-        density_units    = max(1, int(10.0 / density))
+        # ── 3. Background detection (corner-vote) ──────────────────────────────
+        corner_votes = [
+            int(labels_2d[0, 0]),         int(labels_2d[0, img_w - 1]),
+            int(labels_2d[img_h - 1, 0]), int(labels_2d[img_h - 1, img_w - 1]),
+        ]
+        from collections import Counter as _Counter
+        top_bg, top_freq = _Counter(corner_votes).most_common(1)[0]
+        bg_cluster = top_bg if top_freq >= 2 else None
+        print(f"DIGITIZE: k={k}  bg_cluster={bg_cluster}  image={img_w}×{img_h}px", flush=True)
 
-        # ── 4. Pass 1 — collect valid contours per color ──────────────────────
-        # Use an image-scale estimate only for the area/bbox filter checks.
-        img_h, img_w = q_arr.shape[:2]
-        scale_est = min(hoop_w_units / max(img_w, 1), hoop_h_units / max(img_h, 1))
-        MIN_BBOX_PX = 50 / scale_est   # 5 mm in pixels (approx)
+        # ── 4. Hoop constants  (1 pyembroidery unit = 0.1 mm) ─────────────────
+        hoop_w_u = hoop_width_mm  * 10
+        hoop_h_u = hoop_height_mm * 10
+        ROW_U      = 4    # 0.4 mm row spacing
+        STITCH_2MM = 20   # 2 mm running-stitch spacing
+        STITCH_4MM = 40   # 4 mm tatami stitch length
 
+        # ── 5. Contour collection with min-area retry ──────────────────────────
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        color_contours = {}   # color_idx → list of (simplified) contours
 
-        for color_idx in sorted(canonical_palette.keys()):
-            if color_idx == bg_idx:
-                continue
-
-            mask = (q_arr == color_idx).astype(np.uint8) * 255
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            valid = []
-            for c in contours:
-                if cv2.contourArea(c) < 50:
+        def _collect(min_area):
+            out = {}
+            for cidx in range(k):
+                if cidx == bg_cluster:
                     continue
-                _, _, cw, ch = cv2.boundingRect(c)
-                if cw < MIN_BBOX_PX or ch < MIN_BBOX_PX:
-                    continue
-                if do_simplify:
-                    c = cv2.approxPolyDP(c, epsilon=0.5, closed=True)
-                if len(c) >= 3:
-                    valid.append(c)
+                mask = ((labels_2d == cidx).astype(np.uint8) * 255)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+                raw, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                valid  = [c for c in raw if cv2.contourArea(c) >= min_area]
+                if valid:
+                    out[cidx] = valid
+            return out
 
-            if valid:
-                color_contours[color_idx] = valid
+        def _bbox_px(cc):
+            xs = [int(pt[0][0]) for cl in cc.values() for c in cl for pt in c]
+            ys = [int(pt[0][1]) for cl in cc.values() for c in cl for pt in c]
+            if not xs:
+                return 0, 0, 0, 0, 0, 0
+            return min(xs), max(xs), min(ys), max(ys), max(max(xs)-min(xs),1), max(max(ys)-min(ys),1)
 
-        if not color_contours:
-            return jsonify({"error": "No stitchable regions found after filtering. Try a simpler image or adjust color_count."}), 400
+        color_contours = None
+        found_any      = False
+        for min_area in [200, 50, 10]:
+            cc = _collect(min_area)
+            if cc:
+                found_any = True
+                _, _, _, _, pw, ph = _bbox_px(cc)
+                if pw >= 10 and ph >= 10:
+                    color_contours = cc
+                    print(f"DIGITIZE: accepted min_area={min_area} bbox={pw}×{ph}px", flush=True)
+                    break
+                print(f"DIGITIZE: bbox {pw}×{ph}px too small, retrying min_area={min_area}", flush=True)
 
-        # ── 5. Compute content bounding box across ALL valid contours ─────────
-        all_px = []
-        all_py = []
-        for contours_list in color_contours.values():
-            for c in contours_list:
-                for pt in c:
-                    all_px.append(int(pt[0][0]))
-                    all_py.append(int(pt[0][1]))
+        if not found_any:
+            return jsonify({"error": (
+                "No design elements detected — try an image with clearer edges "
+                "and higher contrast"
+            )}), 400
+        if color_contours is None:
+            return jsonify({"error": "Scaling error — design produced at incorrect size"}), 500
 
-        px_min_x = min(all_px)
-        px_max_x = max(all_px)
-        px_min_y = min(all_py)
-        px_max_y = max(all_py)
-        pixel_width  = max(px_max_x - px_min_x, 1)
-        pixel_height = max(px_max_y - px_min_y, 1)
-
-        # Scale to fit hoop with 10% padding, preserving aspect ratio
-        scale_x = hoop_w_units / pixel_width
-        scale_y = hoop_h_units / pixel_height
-        scale   = min(scale_x, scale_y) * 0.9
-
-        # Centering offset so design sits in the middle of the hoop
-        design_w_units  = pixel_width  * scale
-        design_h_units  = pixel_height * scale
-        offset_x = (hoop_w_units - design_w_units) / 2
-        offset_y = (hoop_h_units - design_h_units) / 2
+        # ── 6. Scale & centering ───────────────────────────────────────────────
+        px_min_x, px_max_x, px_min_y, px_max_y, px_w, px_h = _bbox_px(color_contours)
+        scale   = min(hoop_w_u / px_w, hoop_h_u / px_h) * 0.9
+        off_x   = (hoop_w_u - px_w * scale) / 2
+        off_y   = (hoop_h_u - px_h * scale) / 2
 
         def px_to_emb(px, py):
-            """Convert pixel coordinates to pyembroidery units with centering."""
             return (
-                int((px - px_min_x) * scale + offset_x),
-                int((py - px_min_y) * scale + offset_y),
+                int((px - px_min_x) * scale + off_x),
+                int((py - px_min_y) * scale + off_y),
             )
 
-        # ── 6. Build embroidery pattern ────────────────────────────────────────
-        pattern = pyembroidery.EmbPattern()
+        def px_w_to_mm(w_px):
+            return w_px * scale / 10.0
 
-        def add_tie_stitches(pat, ex, ey):
+        # ── 7. Stitch helpers ──────────────────────────────────────────────────
+
+        def tie_on(pat, ex, ey):
+            """3 locking stitches at thread start."""
             for _ in range(3):
-                pat.add_stitch_absolute(pyembroidery.STITCH, ex + 10, ey)
+                pat.add_stitch_absolute(pyembroidery.STITCH, ex + 5, ey)
                 pat.add_stitch_absolute(pyembroidery.STITCH, ex, ey)
 
-        def stitch_contour_running(pat, contour, max_su):
-            """Running stitches along a contour path in embroidery units."""
-            pts = [px_to_emb(int(pt[0][0]), int(pt[0][1])) for pt in contour]
+        def tie_off(pat, ex, ey):
+            """3 locking stitches at thread end."""
+            for _ in range(3):
+                pat.add_stitch_absolute(pyembroidery.STITCH, ex + 5, ey)
+                pat.add_stitch_absolute(pyembroidery.STITCH, ex, ey)
+
+        def running_outline(pat, contour, stitch_u=STITCH_2MM):
+            """Running stitches every stitch_u units around a closed contour."""
+            pts  = [px_to_emb(int(p[0][0]), int(p[0][1])) for p in contour]
             if len(pts) < 2:
                 return
-            pat.add_stitch_absolute(pyembroidery.STITCH, pts[0][0], pts[0][1])
-            prev = pts[0]
-            for pt in pts[1:]:
+            loop = pts + [pts[0]]   # close the path
+            pat.add_stitch_absolute(pyembroidery.STITCH, loop[0][0], loop[0][1])
+            prev = loop[0]
+            for pt in loop[1:]:
                 dx, dy = pt[0] - prev[0], pt[1] - prev[1]
-                dist = math.sqrt(dx * dx + dy * dy)
-                if dist >= max_su:
-                    steps = max(1, int(dist / max_su))
+                dist   = math.sqrt(dx * dx + dy * dy)
+                if dist >= stitch_u:
+                    steps = max(1, int(dist / stitch_u))
                     for i in range(1, steps + 1):
-                        ix = prev[0] + int(dx * i / steps)
-                        iy = prev[1] + int(dy * i / steps)
-                        pat.add_stitch_absolute(pyembroidery.STITCH, ix, iy)
-                else:
+                        pat.add_stitch_absolute(
+                            pyembroidery.STITCH,
+                            prev[0] + int(dx * i / steps),
+                            prev[1] + int(dy * i / steps),
+                        )
+                elif dist > 5:
                     pat.add_stitch_absolute(pyembroidery.STITCH, pt[0], pt[1])
                 prev = pt
-            # close the contour
-            pat.add_stitch_absolute(pyembroidery.STITCH, pts[0][0], pts[0][1])
 
+        def satin_fill(pat, xs_e, ys_e, row_u=ROW_U):
+            """Horizontal satin rows across the bounding box, alternating direction."""
+            mn_x, mx_x = min(xs_e), max(xs_e)
+            mn_y, mx_y = min(ys_e), max(ys_e)
+            toggle = True
+            y = mn_y
+            while y <= mx_y:
+                if toggle:
+                    pat.add_stitch_absolute(pyembroidery.STITCH, mn_x, y)
+                    pat.add_stitch_absolute(pyembroidery.STITCH, mx_x, y)
+                else:
+                    pat.add_stitch_absolute(pyembroidery.STITCH, mx_x, y)
+                    pat.add_stitch_absolute(pyembroidery.STITCH, mn_x, y)
+                y      += row_u
+                toggle  = not toggle
+
+        def tatami_fill(pat, contour, row_u=ROW_U, stitch_u=STITCH_4MM):
+            """Tatami fill clipped to the actual contour mask — no overflow outside shape."""
+            bx, by, bw, bh = cv2.boundingRect(contour)
+            if bw < 1 or bh < 1:
+                return
+            # Pixel-space filled mask for this contour only
+            filled = np.zeros((img_h, img_w), dtype=np.uint8)
+            cv2.drawContours(filled, [contour], 0, 255, thickness=cv2.FILLED)
+
+            # Emb Y range derived from contour corners
+            e_top    = px_to_emb(bx,      by)
+            e_bottom = px_to_emb(bx + bw, by + bh)
+            e_y_min  = min(e_top[1], e_bottom[1])
+            e_y_max  = max(e_top[1], e_bottom[1])
+
+            row = 0
+            y_e = e_y_min
+            while y_e <= e_y_max:
+                # Map emb Y back to nearest pixel row for mask sampling
+                py = max(0, min(img_h - 1, int(round((y_e - off_y) / scale + px_min_y))))
+
+                row_offset = (stitch_u // 2) if row % 2 == 1 else 0
+
+                # Scan pixel columns in contour bbox, emit runs of filled pixels
+                in_run = False
+                run_sx = None
+                for i in range(bw + 1):
+                    pxi = bx + i
+                    on  = (i < bw) and (filled[py, pxi] > 0)
+                    if on and not in_run:
+                        in_run = True
+                        run_sx = pxi
+                    elif not on and in_run:
+                        in_run  = False
+                        run_ex  = pxi - 1
+                        ex_s, _ = px_to_emb(run_sx, py)
+                        ex_e, _ = px_to_emb(run_ex, py)
+                        if ex_s > ex_e:
+                            ex_s, ex_e = ex_e, ex_s
+                        x = ex_s + row_offset
+                        while x <= ex_e:
+                            pat.add_stitch_absolute(pyembroidery.STITCH, x, y_e)
+                            x += stitch_u
+
+                y_e += row_u
+                row += 1
+
+        # ── 8. Build pattern ───────────────────────────────────────────────────
+        pattern      = pyembroidery.EmbPattern()
         first_thread = True
         any_stitches = False
 
-        for color_idx in sorted(color_contours.keys()):
-            rgb = canonical_palette[color_idx]
+        for cidx in sorted(color_contours.keys()):
+            rgb = tuple(int(x) for x in centers[cidx])
 
-            thread = pyembroidery.EmbThread()
+            thread       = pyembroidery.EmbThread()
             thread.color = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]
-            thread.name = "Color #{:02X}{:02X}{:02X}".format(*rgb)
+            thread.name  = "K#{:02X}{:02X}{:02X}".format(*rgb)
             pattern.add_thread(thread)
 
             if not first_thread:
@@ -531,83 +613,81 @@ def digitize():
             first_thread = False
 
             color_first = True
-            for contour in color_contours[color_idx]:
-                emb_pts = [px_to_emb(int(pt[0][0]), int(pt[0][1])) for pt in contour]
+            for contour in color_contours[cidx]:
+                # Optional contour simplification
+                if do_simplify:
+                    contour = cv2.approxPolyDP(contour, epsilon=1.5, closed=True)
+                if len(contour) < 2:
+                    continue
+
+                emb_pts = [px_to_emb(int(p[0][0]), int(p[0][1])) for p in contour]
                 if len(emb_pts) < 2:
                     continue
 
-                xs = [p[0] for p in emb_pts]
-                ys = [p[1] for p in emb_pts]
-                bbox_w_mm = (max(xs) - min(xs)) / 10.0
+                xs_e = [p[0] for p in emb_pts]
+                ys_e = [p[1] for p in emb_pts]
+                _, _, c_w_px, _ = cv2.boundingRect(contour)
+                c_w_mm = px_w_to_mm(c_w_px)
 
-                use_running = stitch_type == "running" or (stitch_type == "auto" and bbox_w_mm < 2)
-                use_satin   = stitch_type == "satin"   or (stitch_type == "auto" and 2 <= bbox_w_mm < 8)
-                use_fill    = stitch_type == "fill"    or (stitch_type == "auto" and bbox_w_mm >= 8)
-
-                first_pt = emb_pts[0]
-                last_pt  = emb_pts[-1]
+                start = emb_pts[0]
+                end   = emb_pts[-1]
 
                 if not color_first:
-                    pattern.add_stitch_absolute(pyembroidery.TRIM, first_pt[0], first_pt[1])
+                    pattern.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
                 color_first = False
 
-                add_tie_stitches(pattern, first_pt[0], first_pt[1])
+                tie_on(pattern, start[0], start[1])
 
-                if use_running:
-                    stitch_contour_running(pattern, contour, max_stitch_units)
+                if stitch_type == "running" or (stitch_type == "auto" and c_w_mm < 3.0):
+                    # ── Small/thin: running stitch only, 2 mm spacing ─────────
+                    running_outline(pattern, contour, stitch_u=STITCH_2MM)
 
-                elif use_satin:
-                    toggle = True
-                    y = min(ys)
-                    while y <= max(ys):
-                        if toggle:
-                            pattern.add_stitch_absolute(pyembroidery.STITCH, min(xs), y)
-                            pattern.add_stitch_absolute(pyembroidery.STITCH, max(xs), y)
-                        else:
-                            pattern.add_stitch_absolute(pyembroidery.STITCH, max(xs), y)
-                            pattern.add_stitch_absolute(pyembroidery.STITCH, min(xs), y)
-                        y += density_units
-                        toggle = not toggle
+                elif stitch_type == "satin" or (stitch_type == "auto" and c_w_mm < 8.0):
+                    # ── Medium: underlay running → satin, 0.4 mm rows ─────────
+                    running_outline(pattern, contour, stitch_u=STITCH_2MM)
+                    pattern.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                    satin_fill(pattern, xs_e, ys_e, row_u=ROW_U)
 
-                elif use_fill:
-                    row = 0
-                    y = min(ys)
-                    while y <= max(ys):
-                        row_offset = (max_stitch_units // 2) if row % 2 == 1 else 0
-                        x = min(xs) + row_offset
-                        while x <= max(xs):
-                            pattern.add_stitch_absolute(pyembroidery.STITCH, x, y)
-                            x += max_stitch_units
-                        y += density_units
-                        row += 1
+                else:
+                    # ── Large: underlay running → tatami fill, 0.4 mm rows ────
+                    running_outline(pattern, contour, stitch_u=STITCH_2MM)
+                    pattern.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                    tatami_fill(pattern, contour, row_u=ROW_U, stitch_u=STITCH_4MM)
 
-                add_tie_stitches(pattern, last_pt[0], last_pt[1])
+                tie_off(pattern, end[0], end[1])
                 any_stitches = True
 
         if not any_stitches:
-            return jsonify({"error": "No stitchable regions found after filtering. Try a simpler image or adjust color_count."}), 400
+            return jsonify({"error": "No stitches generated — try a different image"}), 400
 
         pattern.add_stitch_absolute(pyembroidery.END, 0, 0)
         pyembroidery.write(pattern, tmp_out.name)
 
-        # ── 7. Verify output dimensions ────────────────────────────────────────
+        # ── 9. Verify output ───────────────────────────────────────────────────
         verify = pyembroidery.read(tmp_out.name)
         if verify is not None:
-            vxs = [s[0] for s in verify.stitches if s[2] == pyembroidery.STITCH]
-            vys = [s[1] for s in verify.stitches if s[2] == pyembroidery.STITCH]
-            if vxs and vys:
-                out_w = max(vxs) - min(vxs)
-                out_h = max(vys) - min(vys)
-                if out_w < 1 or out_h < 1:
-                    return jsonify({"error": "Image too complex — try a simpler image with clearer edges"}), 400
+            v_s = [s for s in verify.stitches if s[2] == pyembroidery.STITCH]
+            if v_s:
+                vxs  = [s[0] for s in v_s]; vys = [s[1] for s in v_s]
+                ow   = (max(vxs) - min(vxs)) / 10.0
+                oh   = (max(vys) - min(vys)) / 10.0
+                sc   = len(v_s)
+                print(f"DIGITIZE VERIFY: {sc} stitches  {ow:.1f}mm × {oh:.1f}mm", flush=True)
+                if sc < 500 or sc > 50000:
+                    print(f"DIGITIZE WARN: stitch count {sc} outside 500–50000", flush=True)
+                if not (10 <= ow <= 200 and 10 <= oh <= 200):
+                    print(f"DIGITIZE WARN: dimensions {ow:.1f}×{oh:.1f}mm outside 10–200mm", flush=True)
+                if ow < 1 or oh < 1:
+                    return jsonify({"error": "Scaling error — design produced at incorrect size"}), 500
+
         info = get_design_info(pattern)
         mime = MIME_TYPES.get(output_format, "application/octet-stream")
         response = send_file(tmp_out.name, mimetype=mime, as_attachment=True,
                              download_name="digitized" + output_format)
-        response.headers["stitch_count"] = str(info["stitch_count"])
-        response.headers["color_count"]  = str(info["color_count"])
-        response.headers["width_mm"]     = str(info["width_mm"])
-        response.headers["height_mm"]    = str(info["height_mm"])
+        response.headers["stitch_count"]   = str(info["stitch_count"])
+        response.headers["color_count"]    = str(info["color_count"])
+        response.headers["width_mm"]       = str(info["width_mm"])
+        response.headers["height_mm"]      = str(info["height_mm"])
         response.headers["estimated_time"] = str(info["estimated_time_minutes"])
         print(f"DIGITIZE OK: stitch_count={info['stitch_count']} color_count={info['color_count']} "
               f"width_mm={info['width_mm']} height_mm={info['height_mm']}", flush=True)
