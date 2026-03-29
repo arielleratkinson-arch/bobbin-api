@@ -678,6 +678,14 @@ def digitize():
                 if c_w_emb < MIN_SHAPE_U or c_h_emb < MIN_SHAPE_U:
                     continue
 
+                # ── Oversized-region guard ─────────────────────────────────────
+                # A contour whose bbox covers > 30% of the hoop is almost certainly
+                # a large background region (building interior, text background, etc.)
+                # Force it to running-stitch outline only — never flood-fill it.
+                bbox_area_emb = c_w_emb * c_h_emb
+                hoop_area_emb = hoop_w_u * hoop_h_u
+                is_oversized  = bbox_area_emb > hoop_area_emb * 0.30
+
                 start = emb_pts[0]
                 end   = emb_pts[-1]
 
@@ -687,8 +695,11 @@ def digitize():
 
                 tie_on(pattern, start[0], start[1])
 
-                if stitch_type == "running" or (stitch_type == "auto" and c_w_mm < 3.0):
-                    # ── Small/thin: running stitch only, 2 mm spacing ─────────
+                if is_oversized or stitch_type == "running" or (stitch_type == "auto" and c_w_mm < 3.0):
+                    # ── Running outline: small/thin shapes OR oversized regions ─
+                    if is_oversized:
+                        print(f"DIGITIZE: oversized contour {c_w_emb/10:.1f}×{c_h_emb/10:.1f}mm "
+                              f"({bbox_area_emb/hoop_area_emb*100:.0f}% of hoop) → outline only", flush=True)
                     running_outline(pattern, contour, stitch_u=STITCH_2MM)
 
                 elif stitch_type == "satin" or (stitch_type == "auto" and c_w_mm < 8.0):
