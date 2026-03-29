@@ -592,7 +592,7 @@ def digitize():
             if vxs and vys:
                 out_w = max(vxs) - min(vxs)
                 out_h = max(vys) - min(vys)
-                if out_w < 10 or out_h < 10:
+                if out_w < 1 or out_h < 1:
                     return jsonify({"error": "Image too complex — try a simpler image with clearer edges"}), 400
         info = get_design_info(pattern)
         mime = MIME_TYPES.get(output_format, "application/octet-stream")
