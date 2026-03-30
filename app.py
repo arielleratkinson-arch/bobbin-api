@@ -799,10 +799,23 @@ def digitize():
             return jsonify({"error": "Scaling error — design produced at incorrect size"}), 500
 
         # ── 6. Scale & centering ───────────────────────────────────────────────
+        # pyembroidery's coordinate origin (0, 0) is the CENTRE of the hoop,
+        # not the top-left corner.  All stitch coordinates must be symmetric
+        # around (0, 0) so the machine places the design in the middle of the
+        # hoop rather than in one quadrant.
         px_min_x, px_max_x, px_min_y, px_max_y, px_w, px_h = _bbox_px(color_contours)
-        scale   = min(hoop_w_u / px_w, hoop_h_u / px_h) * 0.9
-        off_x   = (hoop_w_u - px_w * scale) / 2
-        off_y   = (hoop_h_u - px_h * scale) / 2
+        scale   = min(hoop_w_u / px_w, hoop_h_u / px_h) * 0.85
+        # Center the design around the hoop origin (0,0)
+        design_w_u = px_w * scale
+        design_h_u = px_h * scale
+        off_x   = -design_w_u / 2   # left edge offset from center
+        off_y   = -design_h_u / 2   # top  edge offset from center
+        print(
+            f"DIGITIZE SCALE: px_bbox={px_w}×{px_h}  scale={scale:.3f}"
+            f"  design={design_w_u/10:.1f}×{design_h_u/10:.1f}mm"
+            f"  hoop={hoop_w_u/10:.1f}×{hoop_h_u/10:.1f}mm",
+            flush=True,
+        )
 
         def px_to_emb(px, py):
             return (
@@ -925,15 +938,23 @@ def digitize():
                 (ey - off_y) / scale + px_min_y,
             )
 
-        def satin_fill(pat, contour, xs_e, ys_e, row_u=SATIN_ROW_U):
+        def satin_fill(pat, contour, xs_e, ys_e, row_u=SATIN_ROW_U, max_rows=30):
             """Satin rows clipped to the actual contour via pointPolygonTest.
-            Finds the true left/right edge of the shape at each row."""
+            Finds the true left/right edge of the shape at each row.
+            max_rows caps total rows so no single shape dominates stitch count."""
             mn_x, mx_x = min(xs_e), max(xs_e)
             mn_y, mx_y = min(ys_e), max(ys_e)
             contour_f   = contour.astype(np.float32)
             toggle = True
+            # Distribute max_rows evenly across the height span
+            total_span = mx_y - mn_y
+            if total_span > 0 and max_rows > 0:
+                effective_row_u = max(row_u, total_span / max_rows)
+            else:
+                effective_row_u = row_u
+            row = 0
             y_e = mn_y
-            while y_e <= mx_y:
+            while y_e <= mx_y and row < max_rows:
                 _, py = emb_to_px_f(mn_x, y_e)
                 # Scan left→right for first inside point
                 left_x = None
@@ -960,13 +981,16 @@ def digitize():
                     else:
                         pat.add_stitch_absolute(pyembroidery.STITCH, right_x, y_e)
                         pat.add_stitch_absolute(pyembroidery.STITCH, left_x,  y_e)
-                y_e   += row_u
+                y_e   += effective_row_u
                 toggle = not toggle
+                row   += 1
 
-        def tatami_fill(pat, contour, row_u=TATAMI_ROW_U, stitch_u=STITCH_4MM, angle_deg=45):
+        def tatami_fill(pat, contour, row_u=TATAMI_ROW_U, stitch_u=STITCH_4MM,
+                        angle_deg=45, max_rows=30):
             """Tatami fill at a given fill angle (default 45° — industry standard).
             Rotates the scan grid to the requested angle, tests each candidate point
-            in the original coordinate system, then emits the rotated stitch."""
+            in the original coordinate system, then emits the rotated stitch.
+            max_rows caps total scan rows so no single shape dominates stitch count."""
             bx, by, bw, bh = cv2.boundingRect(contour)
             if bw < 1 or bh < 1:
                 return
@@ -996,9 +1020,16 @@ def digitize():
             rx_min, rx_max = rot_verts[:, 0].min(), rot_verts[:, 0].max()
             ry_min, ry_max = rot_verts[:, 1].min(), rot_verts[:, 1].max()
 
+            # Distribute max_rows evenly across the full height range
+            total_span = ry_max - ry_min
+            if total_span > 0 and max_rows > 0:
+                effective_row_u = max(row_u, total_span / max_rows)
+            else:
+                effective_row_u = row_u
+
             row = 0
             ry = ry_min
-            while ry <= ry_max:
+            while ry <= ry_max and row < max_rows:
                 row_offset = (stitch_u // 2) if row % 2 == 1 else 0
                 rx = rx_min + row_offset
                 while rx <= rx_max:
@@ -1007,7 +1038,7 @@ def digitize():
                     if cv2.pointPolygonTest(contour_f, (float(px_t), float(py_t)), False) >= 0:
                         pat.add_stitch_absolute(pyembroidery.STITCH, int(ex), int(ey))
                     rx += stitch_u
-                ry += row_u
+                ry += effective_row_u
                 row += 1
 
         # ── 8. Build pattern ───────────────────────────────────────────────────
@@ -1064,13 +1095,13 @@ def digitize():
                     # Measures what fraction of the contour's enclosed area is
                     # actually covered by this cluster's pixels.
                     #
-                    #   Solid fill (star, heart)  → ~0.95  → tatami/satin fill
+                    #   Solid fill (heart, star)  → ~0.95  → tatami/satin fill
                     #   Hollow outline (building) → ~0.15  → running + satin-path
                     #   Text letter stroke        → ~0.30  → running + satin-path
                     #
-                    # Potrace produces cleaner closed paths, so outline shapes score
-                    # higher (0.4–0.6) than pixel contours do — use a higher threshold
-                    # (0.7) for potrace-derived contours to avoid over-filling outlines.
+                    # Potrace closes outline paths so completely that hollow shapes
+                    # score 0.4–0.7 — use a higher threshold (0.85) so only near-solid
+                    # shapes get fill.  Pixel contours keep the 0.4 threshold.
                     c_mask = np.zeros((img_h, img_w), dtype=np.uint8)
                     cv2.drawContours(c_mask, [contour], -1, 255, thickness=cv2.FILLED)
                     contour_px_area = int(np.count_nonzero(c_mask))
@@ -1080,12 +1111,25 @@ def digitize():
                     else:
                         fill_density = 1.0
 
-                    fill_threshold = 0.7 if cidx in vectorized_cidxs else 0.4
-                    is_hollow      = fill_density <= fill_threshold
+                    fill_threshold = 0.85 if cidx in vectorized_cidxs else 0.4
+
+                    # Large-shape override: bbox > 15mm × 15mm AND fill_density in
+                    # the middle range (0.4–0.85) → force outline only.
+                    # Large shapes in logo-style art are almost always hollow outlines
+                    # (building silhouettes, text frames) even when potrace closes them.
+                    c_w_mm_fill = px_w_to_mm(c_w_px)
+                    c_h_mm_fill = px_w_to_mm(c_h_px)
+                    large_shape_override = (
+                        c_w_mm_fill > 15.0 and c_h_mm_fill > 15.0
+                        and 0.40 < fill_density <= 0.85
+                    )
+
+                    is_hollow = fill_density <= fill_threshold or large_shape_override
                     print(
                         f"DIGITIZE: contour {c_w_emb/10:.1f}×{c_h_emb/10:.1f}mm "
                         f"fd={fill_density:.2f} thresh={fill_threshold} "
-                        f"src={'vec' if cidx in vectorized_cidxs else 'pix'} → "
+                        f"src={'vec' if cidx in vectorized_cidxs else 'pix'}"
+                        f"{' large-override' if large_shape_override else ''} → "
                         f"{'outline' if is_hollow else 'fill'}",
                         flush=True,
                     )
