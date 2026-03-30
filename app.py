@@ -565,6 +565,74 @@ def digitize():
                     pat.add_stitch_absolute(pyembroidery.STITCH, pt[0], pt[1])
                 prev = pt
 
+        def satin_along_path(pat, contour, cluster_mask_2d, stitch_u=STITCH_2MM):
+            """Satin columns perpendicular to the contour path direction.
+            For each stitch position along the path, casts perpendicular rays through
+            the cluster mask to measure actual stroke width, then stitches across it.
+            This makes text and thin outlines look like real embroidered letters."""
+            pts = [px_to_emb(int(p[0][0]), int(p[0][1])) for p in contour]
+            if len(pts) < 3:
+                return
+            loop   = pts + [pts[0]]
+            toggle = True
+            MAX_R  = 80   # max half-width to search: 80 units = 8 mm
+
+            prev = loop[0]
+            for pt in loop[1:]:
+                dx, dy   = pt[0] - prev[0], pt[1] - prev[1]
+                seg_len  = math.sqrt(dx*dx + dy*dy)
+                if seg_len < 1:
+                    prev = pt
+                    continue
+
+                tx, ty = dx / seg_len, dy / seg_len  # unit tangent
+                nx, ny = -ty, tx                      # unit normal (left of tangent)
+
+                steps = max(1, int(seg_len / stitch_u))
+                for i in range(steps):
+                    t_pos = i * stitch_u
+                    if t_pos >= seg_len:
+                        break
+                    x0 = prev[0] + tx * t_pos
+                    y0 = prev[1] + ty * t_pos
+
+                    # Find stroke extent in +normal direction through cluster mask
+                    pos_end = 0
+                    for r in range(MAX_R):
+                        px_c, py_c = emb_to_px_f(x0 + nx * r, y0 + ny * r)
+                        ix, iy = int(round(px_c)), int(round(py_c))
+                        if 0 <= ix < img_w and 0 <= iy < img_h and cluster_mask_2d[iy, ix] > 0:
+                            pos_end = r
+                        else:
+                            break
+
+                    # Find stroke extent in -normal direction through cluster mask
+                    neg_end = 0
+                    for r in range(MAX_R):
+                        px_c, py_c = emb_to_px_f(x0 - nx * r, y0 - ny * r)
+                        ix, iy = int(round(px_c)), int(round(py_c))
+                        if 0 <= ix < img_w and 0 <= iy < img_h and cluster_mask_2d[iy, ix] > 0:
+                            neg_end = r
+                        else:
+                            break
+
+                    left_x  = int(x0 + nx * pos_end)
+                    left_y  = int(y0 + ny * pos_end)
+                    right_x = int(x0 - nx * neg_end)
+                    right_y = int(y0 - ny * neg_end)
+
+                    span = math.sqrt((left_x - right_x)**2 + (left_y - right_y)**2)
+                    if span >= 5:   # minimum column width 0.5 mm
+                        if toggle:
+                            pat.add_stitch_absolute(pyembroidery.STITCH, left_x,  left_y)
+                            pat.add_stitch_absolute(pyembroidery.STITCH, right_x, right_y)
+                        else:
+                            pat.add_stitch_absolute(pyembroidery.STITCH, right_x, right_y)
+                            pat.add_stitch_absolute(pyembroidery.STITCH, left_x,  left_y)
+                        toggle = not toggle
+
+                prev = pt
+
         def emb_to_px_f(ex, ey):
             """Convert embroidery units to floating-point pixel coords for polygon tests."""
             return (
@@ -610,32 +678,51 @@ def digitize():
                 y_e   += row_u
                 toggle = not toggle
 
-        def tatami_fill(pat, contour, row_u=TATAMI_ROW_U, stitch_u=STITCH_4MM):
-            """Tatami fill clipped to the actual contour shape via pointPolygonTest.
-            Each candidate stitch point is tested before being emitted."""
+        def tatami_fill(pat, contour, row_u=TATAMI_ROW_U, stitch_u=STITCH_4MM, angle_deg=45):
+            """Tatami fill at a given fill angle (default 45° — industry standard).
+            Rotates the scan grid to the requested angle, tests each candidate point
+            in the original coordinate system, then emits the rotated stitch."""
             bx, by, bw, bh = cv2.boundingRect(contour)
             if bw < 1 or bh < 1:
                 return
             contour_f = contour.astype(np.float32)
 
-            e_top    = px_to_emb(bx,      by)
-            e_bottom = px_to_emb(bx + bw, by + bh)
-            e_y_min  = min(e_top[1], e_bottom[1])
-            e_y_max  = max(e_top[1], e_bottom[1])
-            e_x_min  = min(e_top[0], e_bottom[0])
-            e_x_max  = max(e_top[0], e_bottom[0])
+            # Get all contour vertices in embroidery coords
+            emb_verts = np.array(
+                [px_to_emb(int(p[0][0]), int(p[0][1])) for p in contour],
+                dtype=np.float64,
+            )
+            cx_e = float(emb_verts[:, 0].mean())
+            cy_e = float(emb_verts[:, 1].mean())
+
+            # Rotate each vertex by -angle so the scan runs horizontally
+            a  = math.radians(angle_deg)
+            ca, sa = math.cos(a), math.sin(a)
+
+            def rot_fwd(ex, ey):   # original → rotated frame
+                dx, dy = ex - cx_e, ey - cy_e
+                return cx_e + dx*ca + dy*sa, cy_e - dx*sa + dy*ca
+
+            def rot_inv(rx, ry):   # rotated frame → original
+                dx, dy = rx - cx_e, ry - cy_e
+                return cx_e + dx*ca - dy*sa, cy_e + dx*sa + dy*ca
+
+            rot_verts = np.array([rot_fwd(v[0], v[1]) for v in emb_verts])
+            rx_min, rx_max = rot_verts[:, 0].min(), rot_verts[:, 0].max()
+            ry_min, ry_max = rot_verts[:, 1].min(), rot_verts[:, 1].max()
 
             row = 0
-            y_e = e_y_min
-            while y_e <= e_y_max:
+            ry = ry_min
+            while ry <= ry_max:
                 row_offset = (stitch_u // 2) if row % 2 == 1 else 0
-                x = e_x_min + row_offset
-                while x <= e_x_max:
-                    px_t, py_t = emb_to_px_f(x, y_e)
+                rx = rx_min + row_offset
+                while rx <= rx_max:
+                    ex, ey = rot_inv(rx, ry)        # back to original emb coords
+                    px_t, py_t = emb_to_px_f(ex, ey)
                     if cv2.pointPolygonTest(contour_f, (float(px_t), float(py_t)), False) >= 0:
-                        pat.add_stitch_absolute(pyembroidery.STITCH, x, y_e)
-                    x += stitch_u
-                y_e += row_u
+                        pat.add_stitch_absolute(pyembroidery.STITCH, int(ex), int(ey))
+                    rx += stitch_u
+                ry += row_u
                 row += 1
 
         # ── 8. Build pattern ───────────────────────────────────────────────────
@@ -656,6 +743,9 @@ def digitize():
                 pattern.add_stitch_absolute(pyembroidery.COLOR_CHANGE, 0, 0)
                 pattern.add_stitch_absolute(pyembroidery.TRIM, 0, 0)
             first_thread = False
+
+            # Cluster mask — precomputed once per color, reused for fill-density + satin-along-path
+            cluster_px_mask = (labels_2d == cidx).astype(np.uint8) * 255
 
             for contour in color_contours[cidx]:
                 # Optional contour simplification
@@ -692,8 +782,7 @@ def digitize():
                 cv2.drawContours(c_mask, [contour], -1, 255, thickness=cv2.FILLED)
                 contour_px_area = int(np.count_nonzero(c_mask))
                 if contour_px_area > 0:
-                    cluster_px    = (labels_2d == cidx).astype(np.uint8) * 255
-                    inside_px     = int(np.count_nonzero(cv2.bitwise_and(c_mask, cluster_px)))
+                    inside_px     = int(np.count_nonzero(cv2.bitwise_and(c_mask, cluster_px_mask)))
                     fill_density  = inside_px / contour_px_area
                 else:
                     fill_density = 1.0          # degenerate contour — default to fill
@@ -715,8 +804,12 @@ def digitize():
                 tie_on(pattern, start[0], start[1])
 
                 if is_hollow or stitch_type == "running" or (stitch_type == "auto" and c_w_mm < 3.0):
-                    # ── Running outline: small/thin shapes OR hollow fill-density ──
+                    # ── Hollow / thin shapes: underlay running → satin columns along path ──
+                    # Satin columns are stitched perpendicular to the contour direction,
+                    # spanning the actual stroke width — makes text look like real embroidery.
                     running_outline(pattern, contour, stitch_u=STITCH_2MM)
+                    pattern.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                    satin_along_path(pattern, contour, cluster_px_mask, stitch_u=STITCH_2MM)
 
                 elif stitch_type == "satin" or (stitch_type == "auto" and c_w_mm < 8.0):
                     # ── Medium: underlay running → satin, 0.5 mm rows ─────────
