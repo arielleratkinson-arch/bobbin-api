@@ -804,12 +804,12 @@ def digitize():
         # around (0, 0) so the machine places the design in the middle of the
         # hoop rather than in one quadrant.
         px_min_x, px_max_x, px_min_y, px_max_y, px_w, px_h = _bbox_px(color_contours)
-        scale   = min(hoop_w_u / px_w, hoop_h_u / px_h) * 0.95
-        # Center the design around the hoop origin (0,0)
+        scale      = min(hoop_w_u / px_w, hoop_h_u / px_h) * 0.95
+        # Center the design at the hoop origin (0,0).
+        # pyembroidery uses (0,0) = hoop center; +X right, +Y down.
+        # Subtract half the design size so the bounding box is symmetric around zero.
         design_w_u = px_w * scale
         design_h_u = px_h * scale
-        off_x   = -design_w_u / 2   # left edge offset from center
-        off_y   = -design_h_u / 2   # top  edge offset from center
         print(
             f"DIGITIZE SCALE: px_bbox={px_w}×{px_h}  scale={scale:.3f}"
             f"  design={design_w_u/10:.1f}×{design_h_u/10:.1f}mm"
@@ -818,9 +818,10 @@ def digitize():
         )
 
         def px_to_emb(px, py):
+            """Pixel → embroidery units, centered at hoop origin (0,0)."""
             return (
-                int((px - px_min_x) * scale + off_x),
-                int((py - px_min_y) * scale + off_y),
+                int((px - px_min_x) * scale - design_w_u / 2),
+                int((py - px_min_y) * scale - design_h_u / 2),
             )
 
         def px_w_to_mm(w_px):
@@ -932,10 +933,10 @@ def digitize():
                 prev = pt
 
         def emb_to_px_f(ex, ey):
-            """Convert embroidery units to floating-point pixel coords for polygon tests."""
+            """Embroidery units → floating-point pixel coords (inverse of px_to_emb)."""
             return (
-                (ex - off_x) / scale + px_min_x,
-                (ey - off_y) / scale + px_min_y,
+                (ex + design_w_u / 2) / scale + px_min_x,
+                (ey + design_h_u / 2) / scale + px_min_y,
             )
 
         def satin_fill(pat, contour, xs_e, ys_e, row_u=SATIN_ROW_U, max_rows=30):
