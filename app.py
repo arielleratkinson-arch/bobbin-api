@@ -1,10 +1,14 @@
 import os
 import io
+import re
 import math
 import json
+import shutil
 import zipfile
 import tempfile
+import subprocess
 import traceback
+import xml.etree.ElementTree as _ET
 from flask import Flask, request, jsonify, send_file, Blueprint
 from flask_cors import CORS
 
@@ -26,6 +30,261 @@ except ImportError:
     Image = None
     ImageDraw = None
 
+
+# ─── POTRACE VECTORIZATION HELPERS ───────────────────────────────────────────
+
+import shutil as _shutil
+
+def _find_potrace():
+    """Find a working potrace binary.  Prefer our self-compiled build (avoids nix SIGSEGV);
+    fall back to any potrace on PATH if the local build doesn't exist."""
+    _local_build = os.path.join(os.path.expanduser("~"), ".local", "bin", "potrace")
+    if os.path.isfile(_local_build) and os.access(_local_build, os.X_OK):
+        return _local_build
+    # Try every PATH entry that has a potrace binary (skip nix-profile ones that may segfault)
+    for _candidate in (_shutil.which("potrace"),):
+        if _candidate and os.path.isfile(_candidate) and os.access(_candidate, os.X_OK):
+            if "nix-profile" not in _candidate:   # nix-profile builds SIGSEGV in Flask subprocess
+                return _candidate
+    return _local_build  # best guess even if missing; _potrace_available() will return False
+
+
+POTRACE_BIN = _find_potrace()
+
+
+def _potrace_available():
+    return bool(POTRACE_BIN) and os.path.isfile(POTRACE_BIN) and os.access(POTRACE_BIN, os.X_OK)
+
+
+def _potrace_env():
+    """Build an environment dict that includes the library paths potrace needs.
+
+    When Flask/gunicorn is launched by Replit's workflow runner it may not inherit
+    the nix-store LD_LIBRARY_PATH that the interactive shell has.  We detect the
+    required dirs from `ldd` once and inject them so the subprocess doesn't SIGSEGV.
+    """
+    env = os.environ.copy()
+    if not _potrace_available():
+        return env
+    try:
+        ldd_out = subprocess.run(
+            ["ldd", POTRACE_BIN], capture_output=True, text=True, timeout=5
+        ).stdout
+        extra_dirs = []
+        for line in ldd_out.splitlines():
+            # Lines look like:  libm.so.6 => /path/to/libm.so.6 (0xaddr)
+            parts = line.split("=>")
+            if len(parts) == 2:
+                lib_path = parts[1].strip().split()[0]
+                if lib_path.startswith("/"):
+                    lib_dir = os.path.dirname(lib_path)
+                    if lib_dir not in ("", "/lib64") and lib_dir not in extra_dirs:
+                        extra_dirs.append(lib_dir)
+        if extra_dirs:
+            existing = env.get("LD_LIBRARY_PATH", "")
+            env["LD_LIBRARY_PATH"] = ":".join(extra_dirs) + (":" + existing if existing else "")
+    except Exception:
+        pass
+    return env
+
+
+# Pre-compute potrace environment once at module load (avoids ldd overhead per request)
+_POTRACE_ENV: dict = {}
+
+
+def _write_pbm(mask_uint8, path):
+    """Write a binary mask (255=foreground/black) as a P1 ASCII PBM file.
+    P1 ASCII format is universally compatible with all potrace builds.
+    Row format: '1' = black/foreground, '0' = white/background."""
+    h, w = mask_uint8.shape
+    with open(path, "w") as f:
+        f.write(f"P1\n{w} {h}\n")
+        for row in mask_uint8:
+            f.write(" ".join("1" if int(px) >= 128 else "0" for px in row))
+            f.write("\n")
+
+
+def _potrace_svg_to_contours(svg_path, img_h, img_w, samples_per_curve=8):
+    """Parse a potrace SVG file and return contours in OpenCV format.
+
+    potrace SVG coordinate system:
+      The <g> element carries  transform="translate(tx,ty) scale(sx,sy)"
+      where sy is negative (flip).  A path coordinate (px, py) maps to
+      image pixel:   x = px*sx + tx,   y = py*sy + ty
+    Returns a list of numpy arrays shaped (N, 1, 2) int32.
+    """
+
+    def _is_num(tok):
+        try:
+            float(tok)
+            return True
+        except ValueError:
+            return False
+
+    def _cubic_bezier(p0, p1, p2, p3, t):
+        mt = 1.0 - t
+        return (
+            mt**3 * p0[0] + 3*mt**2*t * p1[0] + 3*mt*t**2 * p2[0] + t**3 * p3[0],
+            mt**3 * p0[1] + 3*mt**2*t * p1[1] + 3*mt*t**2 * p2[1] + t**3 * p3[1],
+        )
+
+    try:
+        tree = _ET.parse(svg_path)
+        root = tree.getroot()
+    except Exception:
+        return []
+
+    # Namespace-agnostic element search
+    def _find_all(elem, local_tag):
+        return [ch for ch in elem.iter() if ch.tag.split("}")[-1] == local_tag]
+
+    g_elems = _find_all(root, "g")
+    transform = g_elems[0].get("transform", "") if g_elems else ""
+
+    # Parse "translate(tx,ty) scale(sx,sy)"
+    tm = re.search(r"translate\(([^,]+),([^)]+)\)", transform)
+    sm = re.search(r"scale\(([^,]+),([^)]+)\)", transform)
+    tx = float(tm.group(1)) if tm else 0.0
+    ty = float(tm.group(2)) if tm else float(img_h)
+    sx = float(sm.group(1)) if sm else 1.0
+    sy = float(sm.group(2)) if sm else -1.0
+
+    def to_px(ppx, ppy):
+        """potrace path coord → clamped image pixel (int x, int y)."""
+        rx = ppx * sx + tx
+        ry = ppy * sy + ty
+        return (
+            int(round(max(0, min(img_w - 1, rx)))),
+            int(round(max(0, min(img_h - 1, ry)))),
+        )
+
+    def parse_path_d(d):
+        """Parse one SVG path 'd' string → list of (x, y) image-pixel tuples."""
+        # Tokenise: command letters and signed numbers (incl. scientific notation)
+        tokens = re.findall(
+            r"[MCLZSmclzsm]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?", d
+        )
+        pts = []
+        i = 0
+        n = len(tokens)
+        cur = (0.0, 0.0)
+        path_start = (0.0, 0.0)
+        cmd = "M"
+
+        while i < n:
+            if tokens[i].isalpha():
+                cmd = tokens[i]
+                i += 1
+
+            if cmd in ("M", "m"):
+                abs_c = cmd == "M"
+                while i + 1 < n and _is_num(tokens[i]):
+                    x, y = float(tokens[i]), float(tokens[i + 1])
+                    i += 2
+                    cur = (x, y) if abs_c else (cur[0] + x, cur[1] + y)
+                    pts.append(to_px(*cur))
+                    path_start = cur
+                # Subsequent coords after M/m are treated as L/l
+                cmd = "L" if abs_c else "l"
+
+            elif cmd in ("L", "l"):
+                abs_c = cmd == "L"
+                while i + 1 < n and _is_num(tokens[i]):
+                    x, y = float(tokens[i]), float(tokens[i + 1])
+                    i += 2
+                    cur = (x, y) if abs_c else (cur[0] + x, cur[1] + y)
+                    pts.append(to_px(*cur))
+
+            elif cmd in ("C", "c"):
+                abs_c = cmd == "C"
+                while i + 5 < n and _is_num(tokens[i]):
+                    coords = [float(tokens[i + j]) for j in range(6)]
+                    i += 6
+                    if abs_c:
+                        c1 = (coords[0], coords[1])
+                        c2 = (coords[2], coords[3])
+                        ep = (coords[4], coords[5])
+                    else:
+                        c1 = (cur[0] + coords[0], cur[1] + coords[1])
+                        c2 = (cur[0] + coords[2], cur[1] + coords[3])
+                        ep = (cur[0] + coords[4], cur[1] + coords[5])
+                    # Sample cubic bezier: cur → c1 → c2 → ep
+                    for si in range(1, samples_per_curve + 1):
+                        t_val = si / samples_per_curve
+                        bx, by = _cubic_bezier(cur, c1, c2, ep, t_val)
+                        pts.append(to_px(bx, by))
+                    cur = ep
+
+            elif cmd in ("Z", "z"):
+                pts.append(to_px(*path_start))
+                cur = path_start
+                i  # Z has no operands — outer loop will advance cmd
+
+            else:
+                # Unknown command — skip one token to avoid infinite loop
+                if i < n and not tokens[i].isalpha():
+                    i += 1
+                elif i < n:
+                    i += 1  # will be re-read as cmd on next iteration
+
+        return pts
+
+    try:
+        import numpy as _np
+        contours = []
+        for path_elem in _find_all(root, "path"):
+            d = path_elem.get("d", "")
+            if not d:
+                continue
+            pts = parse_path_d(d)
+            if len(pts) >= 3:
+                arr = _np.array([[p] for p in pts], dtype=_np.int32)
+                contours.append(arr)
+        return contours
+    except Exception as exc:
+        print(f"VECTORIZE: SVG parse error: {exc}", flush=True)
+        return []
+
+
+def _vectorize_mask(mask_uint8, tmp_dir, cidx=0):
+    """Run potrace on a binary mask to get clean bezier-derived contours.
+
+    Returns a list of numpy (N,1,2) int32 arrays (OpenCV contour format),
+    or None if potrace is unavailable or produces no contours.
+    """
+    global _POTRACE_ENV
+    if not _potrace_available():
+        return None
+    # Initialise the subprocess environment once (injects nix lib paths to avoid SIGSEGV)
+    if not _POTRACE_ENV:
+        _POTRACE_ENV = _potrace_env()
+        nix_libs = _POTRACE_ENV.get("LD_LIBRARY_PATH", "(none)")
+        print(f"VECTORIZE: potrace env LD_LIBRARY_PATH={nix_libs[:80]}", flush=True)
+    try:
+        import numpy as _np
+        img_h, img_w = mask_uint8.shape
+        pbm = os.path.join(tmp_dir, f"vmask_{cidx}.pbm")
+        svg = os.path.join(tmp_dir, f"vmask_{cidx}.svg")
+        _write_pbm(mask_uint8, pbm)
+        result = subprocess.run(
+            [POTRACE_BIN, "--svg", "-o", svg, pbm],
+            capture_output=True, timeout=20, env=_POTRACE_ENV,
+        )
+        if result.returncode != 0 or not os.path.exists(svg):
+            err = result.stderr.decode(errors="replace")[:120]
+            print(f"VECTORIZE: potrace cidx={cidx} rc={result.returncode}: {err}", flush=True)
+            return None
+        contours = _potrace_svg_to_contours(svg, img_h, img_w)
+        if contours:
+            print(f"VECTORIZE: potrace cidx={cidx} → {len(contours)} smooth path(s)", flush=True)
+            return contours
+        return None
+    except Exception as exc:
+        print(f"VECTORIZE: exception cidx={cidx}: {exc}", flush=True)
+        return None
+
+
+# ─── END VECTORIZATION HELPERS ────────────────────────────────────────────────
 
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
@@ -384,6 +643,9 @@ def digitize():
     tmp_out = tempfile.NamedTemporaryFile(delete=False, suffix=output_format)
     tmp_out.close()
 
+    # Scratch directory for potrace PBM/SVG scratch files
+    vec_tmp = tempfile.mkdtemp(prefix="bobbin_vec_")
+
     try:
         # ── 1. Preprocess image ────────────────────────────────────────────────
         pil_img = Image.open(tmp_in)
@@ -472,15 +734,37 @@ def digitize():
         # ── 5. Contour collection with min-area retry ──────────────────────────
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
+        # ── Pre-compute potrace vectorization once for all non-skip clusters ──
+        # Results are cached here so the retry loop reuses them without re-running potrace.
+        # vectorized_cidxs: set of cidx values where potrace succeeded (skip approxPolyDP later)
+        # _cached_raw[cidx]: pre-computed list of contour arrays for that cluster
+        vectorized_cidxs: set = set()
+        _cached_raw: dict = {}
+
+        potrace_ok = _potrace_available()
+        for _cidx in range(k):
+            if _cidx in skip_clusters:
+                continue
+            _mask = ((labels_2d == _cidx).astype(np.uint8) * 255)
+            _mask = cv2.morphologyEx(_mask, cv2.MORPH_CLOSE, kernel)
+            if potrace_ok:
+                _vec = _vectorize_mask(_mask, vec_tmp, _cidx)
+            else:
+                _vec = None
+            if _vec is not None:
+                vectorized_cidxs.add(_cidx)
+                _cached_raw[_cidx] = _vec
+            else:
+                _raw_cv, _ = cv2.findContours(_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                _cached_raw[_cidx] = list(_raw_cv)
+
         def _collect(min_area):
             out = {}
             for cidx in range(k):
                 if cidx in skip_clusters:
                     continue
-                mask = ((labels_2d == cidx).astype(np.uint8) * 255)
-                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-                raw, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                valid  = [c for c in raw if cv2.contourArea(c) >= min_area]
+                raw   = _cached_raw[cidx]
+                valid = [c for c in raw if cv2.contourArea(c) >= min_area]
                 if valid:
                     out[cidx] = valid
             return out
@@ -748,8 +1032,9 @@ def digitize():
             cluster_px_mask = (labels_2d == cidx).astype(np.uint8) * 255
 
             for contour in color_contours[cidx]:
-                # Optional contour simplification
-                if do_simplify:
+                # Optional contour simplification — skip for potrace-derived contours
+                # (already smooth bezier curves; approxPolyDP would discard that work)
+                if do_simplify and cidx not in vectorized_cidxs:
                     simplified = cv2.approxPolyDP(contour, epsilon=1.5, closed=True)
                     # If simplification produced a degenerate non-convex shape with fewer
                     # than 6 points (e.g. building outline, awning), keep the original
@@ -877,6 +1162,7 @@ def digitize():
         }), 500
     finally:
         _cleanup(tmp_in)
+        shutil.rmtree(vec_tmp, ignore_errors=True)
 
 
 # ─── PREVIEW ─────────────────────────────────────────────────────────────────
