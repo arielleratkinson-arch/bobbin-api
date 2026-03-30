@@ -632,7 +632,8 @@ def digitize():
     min_stitch_length = float(request.form.get("min_stitch_length", 1.5))
     density = float(request.form.get("density", 3.0))                        # updated default
     color_count_param = min(16, max(1, int(request.form.get("color_count", 8))))
-    do_simplify = request.form.get("simplify", "true").lower() not in ("false", "0", "no")
+    do_simplify   = request.form.get("simplify",  "true").lower()  not in ("false", "0", "no")
+    applique_mode = request.form.get("applique",  "false").lower() not in ("false", "0", "no")
 
     allowed_image_ext = [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"]
     tmp_in, in_ext, err = read_uploaded_file(request.files["file"], allowed_image_ext)
@@ -726,6 +727,7 @@ def digitize():
         hoop_h_u = hoop_height_mm * 10
         SATIN_ROW_U  = 5    # 0.5 mm satin row spacing  (~0.45 mm, nearest integer unit)
         TATAMI_ROW_U = 5    # 0.5 mm tatami row spacing
+        STITCH_1_5MM = 15   # 1.5 mm stitch spacing — finer, for thin text strokes
         STITCH_2MM   = 20   # 2 mm running-stitch spacing
         STITCH_4MM   = 40   # 4 mm tatami stitch length
         MIN_SHAPE_U  = 8    # 0.8 mm minimum shape bbox side — low enough to catch thin 'I'/'E'
@@ -1135,28 +1137,91 @@ def digitize():
                     start = emb_pts[0]
                     end   = emb_pts[-1]
 
-                    pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
-                    tie_on(pat, start[0], start[1])
+                    c_h_mm = px_w_to_mm(c_h_px)
 
-                    if is_hollow or stitch_type == "running" or (stitch_type == "auto" and c_w_mm < 3.0):
-                        # Hollow / thin: running underlay + satin columns along path
-                        running_outline(pat, contour, stitch_u=STITCH_2MM)
+                    # ── Thin-text detection ────────────────────────────────────
+                    # Contours where bbox is narrower than 4mm in either dimension
+                    # are thin text strokes.  Use finer 1.5mm stitch spacing so
+                    # the letters look defined rather than gappy.
+                    is_thin = c_w_mm < 4.0 or c_h_mm < 4.0
+
+                    # ── Appliqué detection ─────────────────────────────────────
+                    # A large (>40mm × >40mm) hollow contour (fill_density < 0.3)
+                    # is treated as an appliqué placement when applique_mode=True.
+                    is_applique_candidate = (
+                        applique_mode
+                        and is_hollow
+                        and c_w_mm > 40.0
+                        and c_h_mm > 40.0
+                        and fill_density < 0.3
+                    )
+
+                    # ── Stitch routing ─────────────────────────────────────────
+                    outline_stitch_u = STITCH_1_5MM if is_thin else STITCH_2MM
+
+                    if is_applique_candidate:
+                        # 3-pass appliqué treatment:
+                        # Pass 1 — placement line along contour path
                         pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                        tie_on(pat, start[0], start[1])
+                        running_outline(pat, contour, stitch_u=STITCH_2MM)
+                        tie_off(pat, end[0], end[1])
+                        # Pass 2 — tack-down 2mm inside the contour
+                        # Build an inward-offset approximation by shrinking the
+                        # bbox centre-ward by 20 units (2mm) using erode on a mask.
+                        _ap_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                        cv2.drawContours(_ap_mask, [contour], -1, 255, thickness=cv2.FILLED)
+                        _kern_td = cv2.getStructuringElement(
+                            cv2.MORPH_ELLIPSE,
+                            (max(1, int(20 / scale)), max(1, int(20 / scale)))
+                        )
+                        _inner = cv2.erode(_ap_mask, _kern_td, iterations=1)
+                        _inner_cnts, _ = cv2.findContours(_inner, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        if _inner_cnts:
+                            _td = max(_inner_cnts, key=cv2.contourArea)
+                            _td_pts = [px_to_emb(int(p[0][0]), int(p[0][1])) for p in _td]
+                            if len(_td_pts) >= 2:
+                                pat.add_stitch_absolute(pyembroidery.TRIM, _td_pts[0][0], _td_pts[0][1])
+                                tie_on(pat, _td_pts[0][0], _td_pts[0][1])
+                                running_outline(pat, _td, stitch_u=STITCH_2MM)
+                                tie_off(pat, _td_pts[-1][0], _td_pts[-1][1])
+                        # Pass 3 — satin border along the original contour edge
+                        pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                        tie_on(pat, start[0], start[1])
                         satin_along_path(pat, contour, cluster_px_mask, stitch_u=STITCH_2MM)
+                        tie_off(pat, end[0], end[1])
+                        print(
+                            f"DIGITIZE: appliqué 3-pass {c_w_mm:.1f}×{c_h_mm:.1f}mm fd={fill_density:.2f}",
+                            flush=True,
+                        )
+
+                    elif is_hollow or stitch_type == "running" or (stitch_type == "auto" and c_w_mm < 3.0):
+                        # Hollow / thin: running underlay + satin columns along path
+                        pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                        tie_on(pat, start[0], start[1])
+                        running_outline(pat, contour, stitch_u=outline_stitch_u)
+                        pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                        satin_along_path(pat, contour, cluster_px_mask, stitch_u=outline_stitch_u)
+                        tie_off(pat, end[0], end[1])
 
                     elif stitch_type == "satin" or (stitch_type == "auto" and c_w_mm < 8.0):
                         # Medium: running underlay + satin rows
-                        running_outline(pat, contour, stitch_u=STITCH_2MM)
+                        pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                        tie_on(pat, start[0], start[1])
+                        running_outline(pat, contour, stitch_u=outline_stitch_u)
                         pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
                         satin_fill(pat, contour, xs_e, ys_e, row_u=satin_row_u)
+                        tie_off(pat, end[0], end[1])
 
                     else:
                         # Large: running underlay + tatami fill
-                        running_outline(pat, contour, stitch_u=STITCH_2MM)
+                        pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                        tie_on(pat, start[0], start[1])
+                        running_outline(pat, contour, stitch_u=outline_stitch_u)
                         pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
                         tatami_fill(pat, contour, row_u=tatami_row_u, stitch_u=STITCH_4MM)
+                        tie_off(pat, end[0], end[1])
 
-                    tie_off(pat, end[0], end[1])
                     has_stitches = True
 
             return pat, has_stitches
