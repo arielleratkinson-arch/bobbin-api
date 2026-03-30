@@ -750,7 +750,14 @@ def digitize():
             for contour in color_contours[cidx]:
                 # Optional contour simplification
                 if do_simplify:
-                    contour = cv2.approxPolyDP(contour, epsilon=1.5, closed=True)
+                    simplified = cv2.approxPolyDP(contour, epsilon=1.5, closed=True)
+                    # If simplification produced a degenerate non-convex shape with fewer
+                    # than 6 points (e.g. building outline, awning), keep the original
+                    # to avoid self-intersecting paths that create crossing stitch lines.
+                    if len(simplified) < 6 and not cv2.isContourConvex(simplified):
+                        pass   # keep original contour
+                    else:
+                        contour = simplified
                 if len(contour) < 2:
                     continue
 
@@ -932,17 +939,22 @@ def preview():
             is_drawing = False
 
             for stitch in pattern.stitches:
-                x, y, cmd = stitch[0], stitch[1], stitch[2] & 0xF0
-                px = int((x - min_x) * scale) + pad
-                py = int((y - min_y) * scale) + pad
+                x, y, cmd = stitch[0], stitch[1], stitch[2]   # raw cmd — do NOT mask with 0xF0
+                px = int((x - min_x) * scale) + pad            # STITCH=0,JUMP=1,TRIM=2 are all
+                py = int((y - min_y) * scale) + pad            # < 16, so 0xF0 wipes them to 0
 
                 if cmd == pyembroidery.STITCH:
                     if prev_pt is not None and is_drawing:
                         draw.line([prev_pt, (px, py)], fill=get_color(color_idx), width=1)
                     prev_pt = (px, py)
                     is_drawing = True
-                elif cmd in (pyembroidery.JUMP, pyembroidery.TRIM):
-                    prev_pt = (px, py)
+                elif cmd == pyembroidery.TRIM:
+                    # TRIM: cut thread — reset anchor so no line is drawn to the next stitch
+                    prev_pt = None
+                    is_drawing = False
+                elif cmd == pyembroidery.JUMP:
+                    # JUMP: needle repositions without stitching — suppress the connecting line
+                    prev_pt = None
                     is_drawing = False
                 elif cmd == pyembroidery.COLOR_CHANGE:
                     color_idx += 1
