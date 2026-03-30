@@ -702,13 +702,14 @@ def digitize():
         bg_clusters  = {cidx for cidx, cnt in _edge_counts.items()
                         if cnt / _edge_total >= _threshold}
 
-        # Also exclude any K-means centre that is light (cream/beige/ivory/off-white):
-        # R > 220 AND G > 200 AND B > 180
+        # Also exclude any K-means centre that is light (cream/beige/ivory/off-white).
+        # Threshold: R > 200 AND G > 185 AND B > 165 — catches cream building fills
+        # that potrace traces as large closed paths and would otherwise get tatami fill.
         _light_clusters = {
             cidx for cidx in range(k)
-            if int(centers[cidx][0]) > 220
-            and int(centers[cidx][1]) > 200
-            and int(centers[cidx][2]) > 180
+            if int(centers[cidx][0]) > 200
+            and int(centers[cidx][1]) > 185
+            and int(centers[cidx][2]) > 165
         }
         skip_clusters = bg_clusters | _light_clusters
 
@@ -1010,116 +1011,134 @@ def digitize():
                 row += 1
 
         # ── 8. Build pattern ───────────────────────────────────────────────────
-        pattern      = pyembroidery.EmbPattern()
-        first_thread = True
-        any_stitches = False
+        # Wrapped in a helper so it can be re-run with wider row spacing if the
+        # first pass exceeds the 8,000-stitch density cap.
+        def _build_pattern(satin_row_u=SATIN_ROW_U, tatami_row_u=TATAMI_ROW_U):
+            pat          = pyembroidery.EmbPattern()
+            first_thread = True
+            has_stitches = False
 
-        for cidx in sorted(color_contours.keys()):
-            rgb = tuple(int(x) for x in centers[cidx])
+            for cidx in sorted(color_contours.keys()):
+                rgb = tuple(int(x) for x in centers[cidx])
 
-            thread       = pyembroidery.EmbThread()
-            thread.color = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]
-            thread.name  = "K#{:02X}{:02X}{:02X}".format(*rgb)
-            pattern.add_thread(thread)
+                thread       = pyembroidery.EmbThread()
+                thread.color = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]
+                thread.name  = "K#{:02X}{:02X}{:02X}".format(*rgb)
+                pat.add_thread(thread)
 
-            if not first_thread:
-                # COLOR_CHANGE signals a thread swap; TRIM cuts cleanly before the new color
-                pattern.add_stitch_absolute(pyembroidery.COLOR_CHANGE, 0, 0)
-                pattern.add_stitch_absolute(pyembroidery.TRIM, 0, 0)
-            first_thread = False
+                if not first_thread:
+                    pat.add_stitch_absolute(pyembroidery.COLOR_CHANGE, 0, 0)
+                    pat.add_stitch_absolute(pyembroidery.TRIM, 0, 0)
+                first_thread = False
 
-            # Cluster mask — precomputed once per color, reused for fill-density + satin-along-path
-            cluster_px_mask = (labels_2d == cidx).astype(np.uint8) * 255
+                # Cluster mask — reused for fill-density check and satin-along-path
+                cluster_px_mask = (labels_2d == cidx).astype(np.uint8) * 255
 
-            for contour in color_contours[cidx]:
-                # Optional contour simplification — skip for potrace-derived contours
-                # (already smooth bezier curves; approxPolyDP would discard that work)
-                if do_simplify and cidx not in vectorized_cidxs:
-                    simplified = cv2.approxPolyDP(contour, epsilon=1.5, closed=True)
-                    # If simplification produced a degenerate non-convex shape with fewer
-                    # than 6 points (e.g. building outline, awning), keep the original
-                    # to avoid self-intersecting paths that create crossing stitch lines.
-                    if len(simplified) < 6 and not cv2.isContourConvex(simplified):
-                        pass   # keep original contour
+                for contour in color_contours[cidx]:
+                    # Skip approxPolyDP for potrace contours (already smooth bezier curves)
+                    if do_simplify and cidx not in vectorized_cidxs:
+                        simplified = cv2.approxPolyDP(contour, epsilon=1.5, closed=True)
+                        if len(simplified) < 6 and not cv2.isContourConvex(simplified):
+                            pass   # keep original — avoids self-intersecting paths
+                        else:
+                            contour = simplified
+                    if len(contour) < 2:
+                        continue
+
+                    emb_pts = [px_to_emb(int(p[0][0]), int(p[0][1])) for p in contour]
+                    if len(emb_pts) < 2:
+                        continue
+
+                    xs_e = [p[0] for p in emb_pts]
+                    ys_e = [p[1] for p in emb_pts]
+                    _, _, c_w_px, c_h_px = cv2.boundingRect(contour)
+                    c_w_mm = px_w_to_mm(c_w_px)
+
+                    # Min-shape filter: skip noise shapes below 0.8 mm on either side
+                    c_w_emb = c_w_px * scale
+                    c_h_emb = c_h_px * scale
+                    if c_w_emb < MIN_SHAPE_U or c_h_emb < MIN_SHAPE_U:
+                        continue
+
+                    # ── Fill-density guard ─────────────────────────────────────
+                    # Measures what fraction of the contour's enclosed area is
+                    # actually covered by this cluster's pixels.
+                    #
+                    #   Solid fill (star, heart)  → ~0.95  → tatami/satin fill
+                    #   Hollow outline (building) → ~0.15  → running + satin-path
+                    #   Text letter stroke        → ~0.30  → running + satin-path
+                    #
+                    # Potrace produces cleaner closed paths, so outline shapes score
+                    # higher (0.4–0.6) than pixel contours do — use a higher threshold
+                    # (0.7) for potrace-derived contours to avoid over-filling outlines.
+                    c_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                    cv2.drawContours(c_mask, [contour], -1, 255, thickness=cv2.FILLED)
+                    contour_px_area = int(np.count_nonzero(c_mask))
+                    if contour_px_area > 0:
+                        inside_px    = int(np.count_nonzero(cv2.bitwise_and(c_mask, cluster_px_mask)))
+                        fill_density = inside_px / contour_px_area
                     else:
-                        contour = simplified
-                if len(contour) < 2:
-                    continue
+                        fill_density = 1.0
 
-                emb_pts = [px_to_emb(int(p[0][0]), int(p[0][1])) for p in contour]
-                if len(emb_pts) < 2:
-                    continue
+                    fill_threshold = 0.7 if cidx in vectorized_cidxs else 0.4
+                    is_hollow      = fill_density <= fill_threshold
+                    print(
+                        f"DIGITIZE: contour {c_w_emb/10:.1f}×{c_h_emb/10:.1f}mm "
+                        f"fd={fill_density:.2f} thresh={fill_threshold} "
+                        f"src={'vec' if cidx in vectorized_cidxs else 'pix'} → "
+                        f"{'outline' if is_hollow else 'fill'}",
+                        flush=True,
+                    )
 
-                xs_e = [p[0] for p in emb_pts]
-                ys_e = [p[1] for p in emb_pts]
-                _, _, c_w_px, c_h_px = cv2.boundingRect(contour)
-                c_w_mm  = px_w_to_mm(c_w_px)
+                    start = emb_pts[0]
+                    end   = emb_pts[-1]
 
-                # ── Min-shape filter: skip tiny noise shapes < 3mm × 3mm ──────
-                c_w_emb = c_w_px * scale
-                c_h_emb = c_h_px * scale
-                if c_w_emb < MIN_SHAPE_U or c_h_emb < MIN_SHAPE_U:
-                    continue
+                    pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                    tie_on(pat, start[0], start[1])
 
-                # ── Fill-density guard ─────────────────────────────────────────
-                # Count the actual cluster pixels that fall inside the contour
-                # boundary, divided by the total enclosed pixel area of the contour.
-                #
-                #   Solid star / circle  → fill_density ~0.95  → tatami fill
-                #   Building outline     → fill_density ~0.15  → running outline
-                #   Text letters         → fill_density ~0.30  → running outline
-                #
-                # Threshold: > 0.4 → fill,  ≤ 0.4 → outline only
-                c_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-                cv2.drawContours(c_mask, [contour], -1, 255, thickness=cv2.FILLED)
-                contour_px_area = int(np.count_nonzero(c_mask))
-                if contour_px_area > 0:
-                    inside_px     = int(np.count_nonzero(cv2.bitwise_and(c_mask, cluster_px_mask)))
-                    fill_density  = inside_px / contour_px_area
-                else:
-                    fill_density = 1.0          # degenerate contour — default to fill
+                    if is_hollow or stitch_type == "running" or (stitch_type == "auto" and c_w_mm < 3.0):
+                        # Hollow / thin: running underlay + satin columns along path
+                        running_outline(pat, contour, stitch_u=STITCH_2MM)
+                        pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                        satin_along_path(pat, contour, cluster_px_mask, stitch_u=STITCH_2MM)
 
-                is_hollow = fill_density <= 0.4
-                print(
-                    f"DIGITIZE: contour {c_w_emb/10:.1f}×{c_h_emb/10:.1f}mm "
-                    f"fill_density={fill_density:.2f} → "
-                    f"{'outline' if is_hollow else 'fill'}",
-                    flush=True,
-                )
+                    elif stitch_type == "satin" or (stitch_type == "auto" and c_w_mm < 8.0):
+                        # Medium: running underlay + satin rows
+                        running_outline(pat, contour, stitch_u=STITCH_2MM)
+                        pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                        satin_fill(pat, contour, xs_e, ys_e, row_u=satin_row_u)
 
-                start = emb_pts[0]
-                end   = emb_pts[-1]
+                    else:
+                        # Large: running underlay + tatami fill
+                        running_outline(pat, contour, stitch_u=STITCH_2MM)
+                        pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                        tatami_fill(pat, contour, row_u=tatami_row_u, stitch_u=STITCH_4MM)
 
-                # Always TRIM before moving to this contour's start — eliminates jump lines
-                pattern.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
+                    tie_off(pat, end[0], end[1])
+                    has_stitches = True
 
-                tie_on(pattern, start[0], start[1])
+            return pat, has_stitches
 
-                if is_hollow or stitch_type == "running" or (stitch_type == "auto" and c_w_mm < 3.0):
-                    # ── Hollow / thin shapes: underlay running → satin columns along path ──
-                    # Satin columns are stitched perpendicular to the contour direction,
-                    # spanning the actual stroke width — makes text look like real embroidery.
-                    running_outline(pattern, contour, stitch_u=STITCH_2MM)
-                    pattern.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
-                    satin_along_path(pattern, contour, cluster_px_mask, stitch_u=STITCH_2MM)
-
-                elif stitch_type == "satin" or (stitch_type == "auto" and c_w_mm < 8.0):
-                    # ── Medium: underlay running → satin, 0.5 mm rows ─────────
-                    running_outline(pattern, contour, stitch_u=STITCH_2MM)
-                    pattern.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
-                    satin_fill(pattern, contour, xs_e, ys_e, row_u=SATIN_ROW_U)
-
-                else:
-                    # ── Large: underlay running → tatami fill, 0.5 mm rows ────
-                    running_outline(pattern, contour, stitch_u=STITCH_2MM)
-                    pattern.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
-                    tatami_fill(pattern, contour, row_u=TATAMI_ROW_U, stitch_u=STITCH_4MM)
-
-                tie_off(pattern, end[0], end[1])
-                any_stitches = True
+        # First pass with standard 0.5 mm row spacing
+        pattern, any_stitches = _build_pattern()
 
         if not any_stitches:
             return jsonify({"error": "No stitches generated — try a different image"}), 400
+
+        # ── Stitch-density cap ─────────────────────────────────────────────────
+        # If the first pass produces more than 8,000 stitches the design will be
+        # too dense (overlapping fills on complex logos).  Re-run with 0.8 mm row
+        # spacing, which reduces density by ~37% without changing the stitch type.
+        _first_pass_sc = sum(1 for s in pattern.stitches if s[2] == pyembroidery.STITCH)
+        if _first_pass_sc > 8000:
+            print(
+                f"DIGITIZE: density cap — {_first_pass_sc} stitches > 8000; "
+                "rebuilding with 0.8 mm row spacing",
+                flush=True,
+            )
+            pattern, any_stitches = _build_pattern(satin_row_u=8, tatami_row_u=8)
+            if not any_stitches:
+                return jsonify({"error": "No stitches generated after density adjustment"}), 400
 
         pattern.add_stitch_absolute(pyembroidery.END, 0, 0)
         pyembroidery.write(pattern, tmp_out.name)
