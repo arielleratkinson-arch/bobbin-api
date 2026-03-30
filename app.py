@@ -702,14 +702,12 @@ def digitize():
         bg_clusters  = {cidx for cidx, cnt in _edge_counts.items()
                         if cnt / _edge_total >= _threshold}
 
-        # Also exclude any K-means centre that is light (cream/beige/ivory/off-white).
-        # Threshold: R > 200 AND G > 185 AND B > 165 — catches cream building fills
-        # that potrace traces as large closed paths and would otherwise get tatami fill.
+        # Skip clusters whose average brightness (R+G+B)/3 > 200 — white, cream,
+        # ivory, off-white.  These are too light to show on most embroidery fabrics
+        # and cause unwanted fill regions when potrace closes them as solid paths.
         _light_clusters = {
             cidx for cidx in range(k)
-            if int(centers[cidx][0]) > 200
-            and int(centers[cidx][1]) > 185
-            and int(centers[cidx][2]) > 165
+            if (int(centers[cidx][0]) + int(centers[cidx][1]) + int(centers[cidx][2])) / 3 > 200
         }
         skip_clusters = bg_clusters | _light_clusters
 
@@ -804,7 +802,7 @@ def digitize():
         # around (0, 0) so the machine places the design in the middle of the
         # hoop rather than in one quadrant.
         px_min_x, px_max_x, px_min_y, px_max_y, px_w, px_h = _bbox_px(color_contours)
-        scale   = min(hoop_w_u / px_w, hoop_h_u / px_h) * 0.85
+        scale   = min(hoop_w_u / px_w, hoop_h_u / px_h) * 0.95
         # Center the design around the hoop origin (0,0)
         design_w_u = px_w * scale
         design_h_u = px_h * scale
@@ -1091,46 +1089,46 @@ def digitize():
                     if c_w_emb < MIN_SHAPE_U or c_h_emb < MIN_SHAPE_U:
                         continue
 
-                    # ── Fill-density guard ─────────────────────────────────────
-                    # Measures what fraction of the contour's enclosed area is
-                    # actually covered by this cluster's pixels.
+                    # ── Brightness-based fill / outline decision ──────────────
+                    # Uses the cluster's average RGB brightness to universally
+                    # classify every shape without logo-specific tuning:
                     #
-                    #   Solid fill (heart, star)  → ~0.95  → tatami/satin fill
-                    #   Hollow outline (building) → ~0.15  → running + satin-path
-                    #   Text letter stroke        → ~0.30  → running + satin-path
+                    #   brightness < 80   → dark (black, navy, dark brown)
+                    #                       ALWAYS outline — dark colors in logos
+                    #                       are outlines, never solid fills
                     #
-                    # Potrace closes outline paths so completely that hollow shapes
-                    # score 0.4–0.7 — use a higher threshold (0.85) so only near-solid
-                    # shapes get fill.  Pixel contours keep the 0.4 threshold.
-                    c_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-                    cv2.drawContours(c_mask, [contour], -1, 255, thickness=cv2.FILLED)
-                    contour_px_area = int(np.count_nonzero(c_mask))
-                    if contour_px_area > 0:
-                        inside_px    = int(np.count_nonzero(cv2.bitwise_and(c_mask, cluster_px_mask)))
-                        fill_density = inside_px / contour_px_area
+                    #   brightness > 200  → very light (white, cream, ivory)
+                    #                       SKIP — already in skip_clusters;
+                    #                       guard here for safety
+                    #
+                    #   brightness 80–200 → mid-tone (red, blue, green, gray)
+                    #                       measure fill_density; > 0.75 → fill
+                    #
+                    # This works universally: black outlines → always outline;
+                    # red/colored fills → fill when solid; cream/white → skipped.
+                    brightness = (rgb[0] + rgb[1] + rgb[2]) / 3
+
+                    if brightness < 80:
+                        fill_density = 0.0
+                        is_hollow    = True
+                        _fill_rule   = "dark→outline"
+                    elif brightness > 200:
+                        continue   # safety guard — should be in skip_clusters
                     else:
-                        fill_density = 1.0
+                        c_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+                        cv2.drawContours(c_mask, [contour], -1, 255, thickness=cv2.FILLED)
+                        contour_px_area = int(np.count_nonzero(c_mask))
+                        if contour_px_area > 0:
+                            inside_px    = int(np.count_nonzero(cv2.bitwise_and(c_mask, cluster_px_mask)))
+                            fill_density = inside_px / contour_px_area
+                        else:
+                            fill_density = 1.0
+                        is_hollow  = fill_density <= 0.75
+                        _fill_rule = f"mid fd={fill_density:.2f}→{'outline' if is_hollow else 'fill'}"
 
-                    fill_threshold = 0.85 if cidx in vectorized_cidxs else 0.4
-
-                    # Large-shape override: bbox > 15mm × 15mm AND fill_density in
-                    # the middle range (0.4–0.85) → force outline only.
-                    # Large shapes in logo-style art are almost always hollow outlines
-                    # (building silhouettes, text frames) even when potrace closes them.
-                    c_w_mm_fill = px_w_to_mm(c_w_px)
-                    c_h_mm_fill = px_w_to_mm(c_h_px)
-                    large_shape_override = (
-                        c_w_mm_fill > 15.0 and c_h_mm_fill > 15.0
-                        and 0.40 < fill_density <= 0.85
-                    )
-
-                    is_hollow = fill_density <= fill_threshold or large_shape_override
                     print(
                         f"DIGITIZE: contour {c_w_emb/10:.1f}×{c_h_emb/10:.1f}mm "
-                        f"fd={fill_density:.2f} thresh={fill_threshold} "
-                        f"src={'vec' if cidx in vectorized_cidxs else 'pix'}"
-                        f"{' large-override' if large_shape_override else ''} → "
-                        f"{'outline' if is_hollow else 'fill'}",
+                        f"bright={brightness:.0f} {_fill_rule}",
                         flush=True,
                     )
 
@@ -1169,18 +1167,23 @@ def digitize():
         if not any_stitches:
             return jsonify({"error": "No stitches generated — try a different image"}), 400
 
-        # ── Stitch-density cap ─────────────────────────────────────────────────
-        # If the first pass produces more than 8,000 stitches the design will be
-        # too dense (overlapping fills on complex logos).  Re-run with 0.8 mm row
-        # spacing, which reduces density by ~37% without changing the stitch type.
-        _first_pass_sc = sum(1 for s in pattern.stitches if s[2] == pyembroidery.STITCH)
-        if _first_pass_sc > 8000:
+        # ── Stitch-density cap: 5,000 stitches ────────────────────────────────
+        # If over the limit, increase row spacing by 20% per pass until the
+        # count drops to ≤ 5,000 or 6 retries are exhausted.
+        # Starting from 5 units (0.5 mm): 5 → 6 → 7 → 9 → 10 → 12 → 15 mm.
+        _row_u     = SATIN_ROW_U   # 5 units = 0.5 mm
+        _MAX_CAP_PASSES = 6
+        for _cap_pass in range(_MAX_CAP_PASSES):
+            _sc = sum(1 for s in pattern.stitches if s[2] == pyembroidery.STITCH)
+            if _sc <= 5000:
+                break
+            _row_u = max(_row_u + 1, round(_row_u * 1.2))   # +20%, min +1 unit
             print(
-                f"DIGITIZE: density cap — {_first_pass_sc} stitches > 8000; "
-                "rebuilding with 0.8 mm row spacing",
+                f"DIGITIZE: density cap — {_sc} > 5000; "
+                f"pass {_cap_pass + 1}/{_MAX_CAP_PASSES} → row_u={_row_u} ({_row_u/10:.1f}mm)",
                 flush=True,
             )
-            pattern, any_stitches = _build_pattern(satin_row_u=8, tatami_row_u=8)
+            pattern, any_stitches = _build_pattern(satin_row_u=_row_u, tatami_row_u=_row_u)
             if not any_stitches:
                 return jsonify({"error": "No stitches generated after density adjustment"}), 400
 
