@@ -6,3 +6,6 @@ Pillow
 numpy
 svgpathtools
 gunicorn
+# System dependency: potrace binary (apt: potrace / brew: potrace)
+# Installed automatically via nixpacks.toml on Railway.
+# On Replit, compiled from source: https://potrace.sourceforge.net
