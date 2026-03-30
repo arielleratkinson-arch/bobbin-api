@@ -519,91 +519,6 @@ def convert():
 
 # ─── DIGITIZE ────────────────────────────────────────────────────────────────
 
-def _rgb_distance(c1, c2):
-    """Euclidean distance between two (R, G, B) tuples."""
-    return math.sqrt(sum((a - b) ** 2 for a, b in zip(c1, c2)))
-
-
-def _quantize_colors(pil_img, n_colors):
-    """
-    Reduce pil_img to at most n_colors using PIL palette quantization, then
-    merge any palette entries within 30 RGB units of each other.
-    Returns canonical_palette: {index → (r,g,b)}, and q_arr: numpy uint8 array
-    of pixel → palette index.
-    """
-    rgb = pil_img.convert("RGB")
-
-    # Quantize to a palette image
-    try:
-        quantized = rgb.quantize(colors=n_colors, dither=0)
-    except TypeError:
-        quantized = rgb.quantize(colors=n_colors)
-
-    palette_raw = quantized.getpalette()  # flat [r,g,b, …], length varies by PIL version
-    if not palette_raw:
-        # Fallback: treat image as single color block
-        avg = np.array(rgb).mean(axis=(0, 1)).astype(int)
-        return {0: (int(avg[0]), int(avg[1]), int(avg[2]))}, np.zeros(
-            (pil_img.height, pil_img.width), dtype=np.uint8)
-
-    q_arr = np.array(quantized, dtype=np.uint8)
-
-    # Determine which palette indices are actually used in the image
-    used_indices = sorted(set(q_arr.flatten().tolist()))
-
-    # Build palette only for used indices (capped at n_colors entries)
-    palette = {}
-    for idx in used_indices:
-        if idx * 3 + 2 < len(palette_raw):
-            palette[idx] = (palette_raw[idx*3], palette_raw[idx*3+1], palette_raw[idx*3+2])
-
-    if not palette:
-        return {0: (0, 0, 0)}, np.zeros((pil_img.height, pil_img.width), dtype=np.uint8)
-
-    # Merge similar palette entries (within 30 RGB distance)
-    # Build merge_map: old_idx → canonical_idx
-    all_indices = list(palette.keys())
-    merge_map = {idx: idx for idx in all_indices}
-
-    for i, idx_i in enumerate(all_indices):
-        for idx_j in all_indices[i+1:]:
-            if merge_map[idx_j] == idx_j and _rgb_distance(palette[idx_i], palette[idx_j]) < 30:
-                merge_map[idx_j] = merge_map[idx_i]
-
-    # Remap pixels using a LUT (max palette index + 1 entries)
-    max_idx = max(all_indices) + 1
-    lut = np.arange(max_idx, dtype=np.uint8)
-    for old, new in merge_map.items():
-        if old < max_idx:
-            lut[old] = new
-
-    safe_arr = np.clip(q_arr, 0, max_idx - 1)
-    q_arr = lut[safe_arr]
-
-    # Collect surviving unique canonical entries
-    canonical_palette = {merge_map[idx]: palette[idx]
-                         for idx in all_indices if merge_map[idx] == idx}
-
-    return canonical_palette, q_arr
-
-
-def _detect_background(pil_img, q_arr):
-    """
-    Detect the background color index by sampling the four corner pixels
-    of the quantized image.
-    Returns the most common corner index (int), or None if all corners differ.
-    """
-    h, w = q_arr.shape
-    corners = [
-        q_arr[0, 0], q_arr[0, w - 1],
-        q_arr[h - 1, 0], q_arr[h - 1, w - 1],
-    ]
-    from collections import Counter
-    counts = Counter(corners)
-    bg_idx, freq = counts.most_common(1)[0]
-    return bg_idx if freq >= 2 else None
-
-
 @bp.route("/digitize", methods=["POST"])
 def digitize():
     print(f"DIGITIZE REQUEST: files={list(request.files.keys())}, form={dict(request.form)}", flush=True)
@@ -625,15 +540,12 @@ def digitize():
     if output_format not in SUPPORTED_OUTPUT_FORMATS:
         return jsonify({"error": "Unsupported output format: {}".format(output_format)}), 415
 
-    stitch_type = request.form.get("stitch_type", "auto").lower().strip()
-    hoop_width_mm  = float(request.form.get("hoop_width_mm", 101.6))
-    hoop_height_mm = float(request.form.get("hoop_height_mm", 101.6))
-    max_stitch_length = float(request.form.get("max_stitch_length", 4.0))   # updated default
-    min_stitch_length = float(request.form.get("min_stitch_length", 1.5))
-    density = float(request.form.get("density", 3.0))                        # updated default
+    stitch_type     = request.form.get("stitch_type", "auto").lower().strip()
+    hoop_width_mm   = float(request.form.get("hoop_width_mm",  101.6))
+    hoop_height_mm  = float(request.form.get("hoop_height_mm", 101.6))
     color_count_param = min(16, max(1, int(request.form.get("color_count", 8))))
-    do_simplify   = request.form.get("simplify",  "true").lower()  not in ("false", "0", "no")
-    applique_mode = request.form.get("applique",  "false").lower() not in ("false", "0", "no")
+    do_simplify     = request.form.get("simplify",  "true").lower()  not in ("false", "0", "no")
+    applique_mode   = request.form.get("applique",  "false").lower() not in ("false", "0", "no")
 
     allowed_image_ext = [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"]
     tmp_in, in_ext, err = read_uploaded_file(request.files["file"], allowed_image_ext)
@@ -648,170 +560,167 @@ def digitize():
     vec_tmp = tempfile.mkdtemp(prefix="bobbin_vec_")
 
     try:
-        # ── 1. Preprocess image ────────────────────────────────────────────────
+        # ── STEP 1: Image Loading ──────────────────────────────────────────────
         pil_img = Image.open(tmp_in)
 
-        # Flatten any transparency onto a white background
         if pil_img.mode in ("RGBA", "LA", "PA"):
             if pil_img.mode == "PA":
                 pil_img = pil_img.convert("RGBA")
-            white = Image.new("RGB", pil_img.size, (255, 255, 255))
-            white.paste(pil_img, mask=pil_img.split()[-1])
-            pil_img = white
+            bg = Image.new("RGB", pil_img.size, (255, 255, 255))
+            bg.paste(pil_img, mask=pil_img.split()[-1])
+            pil_img = bg
         elif pil_img.mode == "P" and "transparency" in pil_img.info:
             pil_img = pil_img.convert("RGBA")
-            white = Image.new("RGB", pil_img.size, (255, 255, 255))
-            white.paste(pil_img, mask=pil_img.split()[-1])
-            pil_img = white
+            bg = Image.new("RGB", pil_img.size, (255, 255, 255))
+            bg.paste(pil_img, mask=pil_img.split()[-1])
+            pil_img = bg
         else:
             pil_img = pil_img.convert("RGB")
 
-        img_rgb = np.array(pil_img, dtype=np.uint8)
+        # ── STEP 2: Preprocessing ──────────────────────────────────────────────
+        # Resize to max 500×500 preserving aspect ratio; white-pad to exact square
+        MAX_DIM = 500
+        orig_w, orig_h = pil_img.size
+        if orig_w > MAX_DIM or orig_h > MAX_DIM:
+            ratio   = min(MAX_DIM / orig_w, MAX_DIM / orig_h)
+            new_w   = max(1, int(orig_w * ratio))
+            new_h   = max(1, int(orig_h * ratio))
+            pil_img = pil_img.resize((new_w, new_h), Image.LANCZOS)
+            canvas  = Image.new("RGB", (MAX_DIM, MAX_DIM), (255, 255, 255))
+            canvas.paste(pil_img, ((MAX_DIM - new_w) // 2, (MAX_DIM - new_h) // 2))
+            pil_img = canvas
+
+        img_rgb      = np.array(pil_img, dtype=np.uint8)
         img_h, img_w = img_rgb.shape[:2]
 
         # Bilateral filter — d=5 preserves fine stripe / line details better than d=9
         img_filtered = cv2.bilateralFilter(img_rgb, d=5, sigmaColor=100, sigmaSpace=100)
 
-        # ── 2. K-means color clustering ────────────────────────────────────────
-        k = min(16, max(2, color_count_param))
-        pixels = np.float32(img_filtered.reshape(-1, 3))
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0)
+        # ── STEP 3: Color Clustering ───────────────────────────────────────────
+        k         = min(16, max(2, color_count_param))
+        pixels    = np.float32(img_filtered.reshape(-1, 3))
+        criteria  = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0)
         _, labels_flat, centers = cv2.kmeans(
             pixels, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS
         )
-        centers   = np.uint8(centers)                              # k × 3 RGB
-        labels_2d = labels_flat.flatten().reshape(img_h, img_w)   # pixel → cluster
+        centers   = np.uint8(centers)
+        labels_2d = labels_flat.flatten().reshape(img_h, img_w)
 
-        # ── 3. Background detection (edge-sampling) ────────────────────────────
-        # Sample 20 evenly-spaced pixels along each of the 4 edges (80 total).
-        # Any cluster appearing in > 30% of edge pixels is treated as background.
+        # Background: brightness > 200 OR appears in > 30% of edge pixels
         from collections import Counter as _Counter
-        _edge_samples = []
-        _n = 20
+        _n      = 20
+        _edge_s = []
         for _i in range(_n):
-            _t = int(_i * (img_w - 1) / max(_n - 1, 1))
-            _edge_samples.append(int(labels_2d[0,           _t]))        # top
-            _edge_samples.append(int(labels_2d[img_h - 1,  _t]))        # bottom
+            _tx = int(_i * (img_w - 1) / max(_n - 1, 1))
+            _edge_s += [int(labels_2d[0, _tx]), int(labels_2d[img_h - 1, _tx])]
         for _i in range(_n):
-            _t = int(_i * (img_h - 1) / max(_n - 1, 1))
-            _edge_samples.append(int(labels_2d[_t,          0]))         # left
-            _edge_samples.append(int(labels_2d[_t, img_w - 1]))         # right
-
-        _edge_total  = len(_edge_samples)
-        _edge_counts = _Counter(_edge_samples)
-        _threshold   = 0.30                                              # 30% of edge pixels
-        bg_clusters  = {cidx for cidx, cnt in _edge_counts.items()
-                        if cnt / _edge_total >= _threshold}
-
-        # Skip clusters whose average brightness (R+G+B)/3 > 200 — white, cream,
-        # ivory, off-white.  These are too light to show on most embroidery fabrics
-        # and cause unwanted fill regions when potrace closes them as solid paths.
-        _light_clusters = {
-            cidx for cidx in range(k)
-            if (int(centers[cidx][0]) + int(centers[cidx][1]) + int(centers[cidx][2])) / 3 > 200
+            _ty = int(_i * (img_h - 1) / max(_n - 1, 1))
+            _edge_s += [int(labels_2d[_ty, 0]), int(labels_2d[_ty, img_w - 1])]
+        _edge_total  = len(_edge_s)
+        _edge_counts = _Counter(_edge_s)
+        _edge_bg     = {c for c, cnt in _edge_counts.items() if cnt / _edge_total >= 0.30}
+        _light_bg    = {
+            c for c in range(k)
+            if (int(centers[c][0]) + int(centers[c][1]) + int(centers[c][2])) / 3 > 200
         }
-        skip_clusters = bg_clusters | _light_clusters
+        bg_clusters = _edge_bg | _light_bg
+        print(f"DIGITIZE: k={k}  bg_clusters={bg_clusters}  image={img_w}×{img_h}px", flush=True)
 
-        # Keep the single legacy name for logging / backward compat
-        bg_cluster = next(iter(bg_clusters)) if len(bg_clusters) == 1 else (
-            _edge_counts.most_common(1)[0][0] if bg_clusters else None
-        )
-        print(
-            f"DIGITIZE: k={k}  bg_clusters={bg_clusters}  light_clusters={_light_clusters}"
-            f"  image={img_w}×{img_h}px",
-            flush=True,
-        )
+        # ── STEP 4: Vectorization per Color Cluster ────────────────────────────
+        hoop_w_u     = hoop_width_mm  * 10
+        hoop_h_u     = hoop_height_mm * 10
+        STITCH_2MM   = 20    # 2 mm running-stitch spacing
+        STITCH_1_5MM = 15    # 1.5 mm — finer stitch for thin text strokes
+        TATAMI_ROW_U = 5     # 0.5 mm tatami row spacing
+        STITCH_4MM   = 40    # 4 mm tatami stitch length
+        MIN_SHAPE_U  = 8     # 0.8 mm minimum shape bbox side
 
-        # ── 4. Hoop constants  (1 pyembroidery unit = 0.1 mm) ─────────────────
-        hoop_w_u = hoop_width_mm  * 10
-        hoop_h_u = hoop_height_mm * 10
-        SATIN_ROW_U  = 5    # 0.5 mm satin row spacing  (~0.45 mm, nearest integer unit)
-        TATAMI_ROW_U = 5    # 0.5 mm tatami row spacing
-        STITCH_1_5MM = 15   # 1.5 mm stitch spacing — finer, for thin text strokes
-        STITCH_2MM   = 20   # 2 mm running-stitch spacing
-        STITCH_4MM   = 40   # 4 mm tatami stitch length
-        MIN_SHAPE_U  = 8    # 0.8 mm minimum shape bbox side — low enough to catch thin 'I'/'E'
+        k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
-        # ── 5. Contour collection with min-area retry ──────────────────────────
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        # cluster_data: {cidx: {"rgb", "brightness", "contours": [(arr, fill_density, stitch_t)]}}
+        cluster_data: dict        = {}
+        vectorized_cidxs: set     = set()
 
-        # ── Pre-compute potrace vectorization once for all non-skip clusters ──
-        # Results are cached here so the retry loop reuses them without re-running potrace.
-        # vectorized_cidxs: set of cidx values where potrace succeeded (skip approxPolyDP later)
-        # _cached_raw[cidx]: pre-computed list of contour arrays for that cluster
-        vectorized_cidxs: set = set()
-        _cached_raw: dict = {}
-
-        potrace_ok = _potrace_available()
-        for _cidx in range(k):
-            if _cidx in skip_clusters:
+        for cidx in range(k):
+            if cidx in bg_clusters:
                 continue
-            _mask = ((labels_2d == _cidx).astype(np.uint8) * 255)
-            _mask = cv2.morphologyEx(_mask, cv2.MORPH_CLOSE, kernel)
-            if potrace_ok:
-                _vec = _vectorize_mask(_mask, vec_tmp, _cidx)
-            else:
-                _vec = None
-            if _vec is not None:
-                vectorized_cidxs.add(_cidx)
-                _cached_raw[_cidx] = _vec
-            else:
-                _raw_cv, _ = cv2.findContours(_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                _cached_raw[_cidx] = list(_raw_cv)
+            rgb        = tuple(int(x) for x in centers[cidx])
+            brightness = (rgb[0] + rgb[1] + rgb[2]) / 3.0
+            if brightness > 200:
+                continue
 
-        def _collect(min_area):
-            out = {}
-            for cidx in range(k):
-                if cidx in skip_clusters:
+            mask = ((labels_2d == cidx).astype(np.uint8) * 255)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k3)
+
+            # Vectorize with potrace; fall back to cv2.findContours
+            raw_contours = None
+            if _potrace_available():
+                raw_contours = _vectorize_mask(mask, vec_tmp, cidx)
+                if raw_contours is not None:
+                    vectorized_cidxs.add(cidx)
+            if raw_contours is None:
+                raw_c, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                raw_contours = list(raw_c)
+
+            cluster_mask  = (labels_2d == cidx).astype(np.uint8) * 255
+            contours_info = []
+            for contour in raw_contours:
+                if cv2.contourArea(contour) < 50:
                     continue
-                raw   = _cached_raw[cidx]
-                valid = [c for c in raw if cv2.contourArea(c) >= min_area]
-                if valid:
-                    out[cidx] = valid
-            return out
+                c_mask = np.zeros((img_h, img_w), np.uint8)
+                cv2.drawContours(c_mask, [contour], -1, 255, cv2.FILLED)
+                c_area = int(np.count_nonzero(c_mask))
+                if c_area > 0:
+                    fill_density = (
+                        int(np.count_nonzero(cv2.bitwise_and(c_mask, cluster_mask))) / c_area
+                    )
+                else:
+                    fill_density = 1.0
 
-        def _bbox_px(cc):
-            xs = [int(pt[0][0]) for cl in cc.values() for c in cl for pt in c]
-            ys = [int(pt[0][1]) for cl in cc.values() for c in cl for pt in c]
-            if not xs:
-                return 0, 0, 0, 0, 0, 0
-            return min(xs), max(xs), min(ys), max(ys), max(max(xs)-min(xs),1), max(max(ys)-min(ys),1)
+                # Stitch type per spec:
+                #   brightness < 80  → ALWAYS running stitch (dark outlines)
+                #   fill_density > 0.75 → tatami fill (solid colored shapes)
+                #   otherwise → running stitch outline
+                if brightness < 80:
+                    stitch_t = "running"
+                elif fill_density > 0.75:
+                    stitch_t = "tatami"
+                else:
+                    stitch_t = "running"
 
-        color_contours = None
-        found_any      = False
-        for min_area in [200, 50, 10, 8]:
-            cc = _collect(min_area)
-            if cc:
-                found_any = True
-                _, _, _, _, pw, ph = _bbox_px(cc)
-                if pw >= 10 and ph >= 10:
-                    color_contours = cc
-                    print(f"DIGITIZE: accepted min_area={min_area} bbox={pw}×{ph}px", flush=True)
-                    break
-                print(f"DIGITIZE: bbox {pw}×{ph}px too small, retrying min_area={min_area}", flush=True)
+                contours_info.append((contour, fill_density, stitch_t))
 
-        if not found_any:
+            if contours_info:
+                cluster_data[cidx] = {
+                    "rgb":        rgb,
+                    "brightness": brightness,
+                    "contours":   contours_info,
+                }
+
+        if not cluster_data:
             return jsonify({"error": (
                 "No design elements detected — try an image with clearer edges "
                 "and higher contrast"
             )}), 400
-        if color_contours is None:
-            return jsonify({"error": "Scaling error — design produced at incorrect size"}), 500
 
-        # ── 6. Scale & centering ───────────────────────────────────────────────
-        # pyembroidery's coordinate origin (0, 0) is the CENTRE of the hoop,
-        # not the top-left corner.  All stitch coordinates must be symmetric
-        # around (0, 0) so the machine places the design in the middle of the
-        # hoop rather than in one quadrant.
-        px_min_x, px_max_x, px_min_y, px_max_y, px_w, px_h = _bbox_px(color_contours)
-        scale      = min(hoop_w_u / px_w, hoop_h_u / px_h) * 0.95
-        # Center the design at the hoop origin (0,0).
-        # pyembroidery uses (0,0) = hoop center; +X right, +Y down.
-        # Subtract half the design size so the bounding box is symmetric around zero.
-        design_w_u = px_w * scale
-        design_h_u = px_h * scale
+        # ── STEP 5: Scaling and Centering ─────────────────────────────────────
+        # Collect ALL contour points from ALL clusters for one unified bounding box.
+        # pyembroidery origin (0,0) = hoop centre; +X right, +Y down.
+        all_px = [int(p[0][0]) for d in cluster_data.values() for c, _, _ in d["contours"] for p in c]
+        all_py = [int(p[0][1]) for d in cluster_data.values() for c, _, _ in d["contours"] for p in c]
+        if not all_px:
+            return jsonify({"error": "No contour points found after vectorization"}), 400
+
+        px_min_x     = min(all_px);  px_max_x = max(all_px)
+        px_min_y     = min(all_py);  px_max_y = max(all_py)
+        pixel_width  = max(px_max_x - px_min_x, 1)
+        pixel_height = max(px_max_y - px_min_y, 1)
+        scale        = min(hoop_w_u / pixel_width, hoop_h_u / pixel_height) * 0.90
+        design_w_u   = pixel_width  * scale
+        design_h_u   = pixel_height * scale
+
         print(
-            f"DIGITIZE SCALE: px_bbox={px_w}×{px_h}  scale={scale:.3f}"
+            f"DIGITIZE SCALE: px_bbox={pixel_width}×{pixel_height}  scale={scale:.3f}"
             f"  design={design_w_u/10:.1f}×{design_h_u/10:.1f}mm"
             f"  hoop={hoop_w_u/10:.1f}×{hoop_h_u/10:.1f}mm",
             flush=True,
@@ -824,11 +733,14 @@ def digitize():
                 int((py - px_min_y) * scale - design_h_u / 2),
             )
 
-        def px_w_to_mm(w_px):
-            return w_px * scale / 10.0
+        def emb_to_px_f(ex, ey):
+            """Embroidery units → floating-point pixel coords (inverse of px_to_emb)."""
+            return (
+                (ex + design_w_u / 2) / scale + px_min_x,
+                (ey + design_h_u / 2) / scale + px_min_y,
+            )
 
-        # ── 7. Stitch helpers ──────────────────────────────────────────────────
-
+        # ── STEP 6: Stitch Generation ──────────────────────────────────────────
         def tie_on(pat, ex, ey):
             """3 locking stitches at thread start."""
             for _ in range(3):
@@ -846,7 +758,7 @@ def digitize():
             pts  = [px_to_emb(int(p[0][0]), int(p[0][1])) for p in contour]
             if len(pts) < 2:
                 return
-            loop = pts + [pts[0]]   # close the path
+            loop = pts + [pts[0]]
             pat.add_stitch_absolute(pyembroidery.STITCH, loop[0][0], loop[0][1])
             prev = loop[0]
             for pt in loop[1:]:
@@ -864,194 +776,44 @@ def digitize():
                     pat.add_stitch_absolute(pyembroidery.STITCH, pt[0], pt[1])
                 prev = pt
 
-        def satin_along_path(pat, contour, cluster_mask_2d, stitch_u=STITCH_2MM):
-            """Satin columns perpendicular to the contour path direction.
-            For each stitch position along the path, casts perpendicular rays through
-            the cluster mask to measure actual stroke width, then stitches across it.
-            This makes text and thin outlines look like real embroidered letters."""
-            pts = [px_to_emb(int(p[0][0]), int(p[0][1])) for p in contour]
-            if len(pts) < 3:
-                return
-            loop   = pts + [pts[0]]
-            toggle = True
-            MAX_R  = 80   # max half-width to search: 80 units = 8 mm
-
-            prev = loop[0]
-            for pt in loop[1:]:
-                dx, dy   = pt[0] - prev[0], pt[1] - prev[1]
-                seg_len  = math.sqrt(dx*dx + dy*dy)
-                if seg_len < 1:
-                    prev = pt
-                    continue
-
-                tx, ty = dx / seg_len, dy / seg_len  # unit tangent
-                nx, ny = -ty, tx                      # unit normal (left of tangent)
-
-                steps = max(1, int(seg_len / stitch_u))
-                for i in range(steps):
-                    t_pos = i * stitch_u
-                    if t_pos >= seg_len:
-                        break
-                    x0 = prev[0] + tx * t_pos
-                    y0 = prev[1] + ty * t_pos
-
-                    # Find stroke extent in +normal direction through cluster mask
-                    pos_end = 0
-                    for r in range(MAX_R):
-                        px_c, py_c = emb_to_px_f(x0 + nx * r, y0 + ny * r)
-                        ix, iy = int(round(px_c)), int(round(py_c))
-                        if 0 <= ix < img_w and 0 <= iy < img_h and cluster_mask_2d[iy, ix] > 0:
-                            pos_end = r
-                        else:
-                            break
-
-                    # Find stroke extent in -normal direction through cluster mask
-                    neg_end = 0
-                    for r in range(MAX_R):
-                        px_c, py_c = emb_to_px_f(x0 - nx * r, y0 - ny * r)
-                        ix, iy = int(round(px_c)), int(round(py_c))
-                        if 0 <= ix < img_w and 0 <= iy < img_h and cluster_mask_2d[iy, ix] > 0:
-                            neg_end = r
-                        else:
-                            break
-
-                    left_x  = int(x0 + nx * pos_end)
-                    left_y  = int(y0 + ny * pos_end)
-                    right_x = int(x0 - nx * neg_end)
-                    right_y = int(y0 - ny * neg_end)
-
-                    span = math.sqrt((left_x - right_x)**2 + (left_y - right_y)**2)
-                    if span >= 5:   # minimum column width 0.5 mm
-                        if toggle:
-                            pat.add_stitch_absolute(pyembroidery.STITCH, left_x,  left_y)
-                            pat.add_stitch_absolute(pyembroidery.STITCH, right_x, right_y)
-                        else:
-                            pat.add_stitch_absolute(pyembroidery.STITCH, right_x, right_y)
-                            pat.add_stitch_absolute(pyembroidery.STITCH, left_x,  left_y)
-                        toggle = not toggle
-
-                prev = pt
-
-        def emb_to_px_f(ex, ey):
-            """Embroidery units → floating-point pixel coords (inverse of px_to_emb)."""
-            return (
-                (ex + design_w_u / 2) / scale + px_min_x,
-                (ey + design_h_u / 2) / scale + px_min_y,
-            )
-
-        def satin_fill(pat, contour, xs_e, ys_e, row_u=SATIN_ROW_U, max_rows=30):
-            """Satin rows clipped to the actual contour via pointPolygonTest.
-            Finds the true left/right edge of the shape at each row.
-            max_rows caps total rows so no single shape dominates stitch count."""
-            mn_x, mx_x = min(xs_e), max(xs_e)
-            mn_y, mx_y = min(ys_e), max(ys_e)
-            contour_f   = contour.astype(np.float32)
-            toggle = True
-            # Distribute max_rows evenly across the height span
-            total_span = mx_y - mn_y
-            if total_span > 0 and max_rows > 0:
-                effective_row_u = max(row_u, total_span / max_rows)
-            else:
-                effective_row_u = row_u
-            row = 0
-            y_e = mn_y
-            while y_e <= mx_y and row < max_rows:
-                _, py = emb_to_px_f(mn_x, y_e)
-                # Scan left→right for first inside point
-                left_x = None
-                x_e = mn_x
-                while x_e <= mx_x:
-                    px_t, _ = emb_to_px_f(x_e, y_e)
-                    if cv2.pointPolygonTest(contour_f, (float(px_t), float(py)), False) >= 0:
-                        left_x = x_e
-                        break
-                    x_e += 1
-                # Scan right→left for last inside point
-                right_x = None
-                x_e = mx_x
-                while x_e >= mn_x:
-                    px_t, _ = emb_to_px_f(x_e, y_e)
-                    if cv2.pointPolygonTest(contour_f, (float(px_t), float(py)), False) >= 0:
-                        right_x = x_e
-                        break
-                    x_e -= 1
-                if left_x is not None and right_x is not None and right_x >= left_x:
-                    if toggle:
-                        pat.add_stitch_absolute(pyembroidery.STITCH, left_x,  y_e)
-                        pat.add_stitch_absolute(pyembroidery.STITCH, right_x, y_e)
-                    else:
-                        pat.add_stitch_absolute(pyembroidery.STITCH, right_x, y_e)
-                        pat.add_stitch_absolute(pyembroidery.STITCH, left_x,  y_e)
-                y_e   += effective_row_u
-                toggle = not toggle
-                row   += 1
-
-        def tatami_fill(pat, contour, row_u=TATAMI_ROW_U, stitch_u=STITCH_4MM,
-                        angle_deg=45, max_rows=30):
-            """Tatami fill at a given fill angle (default 45° — industry standard).
-            Rotates the scan grid to the requested angle, tests each candidate point
-            in the original coordinate system, then emits the rotated stitch.
-            max_rows caps total scan rows so no single shape dominates stitch count."""
-            bx, by, bw, bh = cv2.boundingRect(contour)
-            if bw < 1 or bh < 1:
-                return
+        def tatami_fill(pat, contour, row_u=TATAMI_ROW_U, stitch_u=STITCH_4MM, max_rows=50):
+            """Scanline tatami fill with pointPolygonTest clipping.
+            0.5 mm row spacing; odd rows offset by half a stitch length."""
             contour_f = contour.astype(np.float32)
-
-            # Get all contour vertices in embroidery coords
             emb_verts = np.array(
                 [px_to_emb(int(p[0][0]), int(p[0][1])) for p in contour],
                 dtype=np.float64,
             )
-            cx_e = float(emb_verts[:, 0].mean())
-            cy_e = float(emb_verts[:, 1].mean())
-
-            # Rotate each vertex by -angle so the scan runs horizontally
-            a  = math.radians(angle_deg)
-            ca, sa = math.cos(a), math.sin(a)
-
-            def rot_fwd(ex, ey):   # original → rotated frame
-                dx, dy = ex - cx_e, ey - cy_e
-                return cx_e + dx*ca + dy*sa, cy_e - dx*sa + dy*ca
-
-            def rot_inv(rx, ry):   # rotated frame → original
-                dx, dy = rx - cx_e, ry - cy_e
-                return cx_e + dx*ca - dy*sa, cy_e + dx*sa + dy*ca
-
-            rot_verts = np.array([rot_fwd(v[0], v[1]) for v in emb_verts])
-            rx_min, rx_max = rot_verts[:, 0].min(), rot_verts[:, 0].max()
-            ry_min, ry_max = rot_verts[:, 1].min(), rot_verts[:, 1].max()
-
-            # Distribute max_rows evenly across the full height range
-            total_span = ry_max - ry_min
-            if total_span > 0 and max_rows > 0:
-                effective_row_u = max(row_u, total_span / max_rows)
-            else:
-                effective_row_u = row_u
-
+            if len(emb_verts) < 3:
+                return
+            mn_x = float(emb_verts[:, 0].min());  mx_x = float(emb_verts[:, 0].max())
+            mn_y = float(emb_verts[:, 1].min());  mx_y = float(emb_verts[:, 1].max())
+            total_span      = mx_y - mn_y
+            effective_row_u = max(row_u, total_span / max_rows) if total_span > 0 else row_u
             row = 0
-            ry = ry_min
-            while ry <= ry_max and row < max_rows:
-                row_offset = (stitch_u // 2) if row % 2 == 1 else 0
-                rx = rx_min + row_offset
-                while rx <= rx_max:
-                    ex, ey = rot_inv(rx, ry)        # back to original emb coords
-                    px_t, py_t = emb_to_px_f(ex, ey)
+            y_e = mn_y
+            while y_e <= mx_y and row < max_rows:
+                x_start = mn_x + (stitch_u / 2 if row % 2 == 1 else 0)
+                x_e     = x_start
+                while x_e <= mx_x:
+                    px_t, py_t = emb_to_px_f(x_e, y_e)
                     if cv2.pointPolygonTest(contour_f, (float(px_t), float(py_t)), False) >= 0:
-                        pat.add_stitch_absolute(pyembroidery.STITCH, int(ex), int(ey))
-                    rx += stitch_u
-                ry += effective_row_u
+                        pat.add_stitch_absolute(pyembroidery.STITCH, int(x_e), int(y_e))
+                    x_e += stitch_u
+                y_e += effective_row_u
                 row += 1
 
-        # ── 8. Build pattern ───────────────────────────────────────────────────
-        # Wrapped in a helper so it can be re-run with wider row spacing if the
-        # first pass exceeds the 8,000-stitch density cap.
-        def _build_pattern(satin_row_u=SATIN_ROW_U, tatami_row_u=TATAMI_ROW_U):
+        # Sort colors darkest to lightest (dark outlines sewn first, fills on top)
+        sorted_cidxs = sorted(cluster_data.keys(), key=lambda c: cluster_data[c]["brightness"])
+
+        def _build_pattern(tatami_row_u=TATAMI_ROW_U):
             pat          = pyembroidery.EmbPattern()
             first_thread = True
             has_stitches = False
 
-            for cidx in sorted(color_contours.keys()):
-                rgb = tuple(int(x) for x in centers[cidx])
+            for cidx in sorted_cidxs:
+                info = cluster_data[cidx]
+                rgb  = info["rgb"]
 
                 thread       = pyembroidery.EmbThread()
                 thread.color = (rgb[0] << 16) | (rgb[1] << 8) | rgb[2]
@@ -1060,231 +822,158 @@ def digitize():
 
                 if not first_thread:
                     pat.add_stitch_absolute(pyembroidery.COLOR_CHANGE, 0, 0)
-                    pat.add_stitch_absolute(pyembroidery.TRIM, 0, 0)
                 first_thread = False
 
-                # Cluster mask — reused for fill-density check and satin-along-path
-                cluster_px_mask = (labels_2d == cidx).astype(np.uint8) * 255
-
-                for contour in color_contours[cidx]:
-                    # Skip approxPolyDP for potrace contours (already smooth bezier curves)
+                for contour, fill_density, stitch_t in info["contours"]:
+                    # Simplify non-potrace contours to reduce noise
                     if do_simplify and cidx not in vectorized_cidxs:
                         simplified = cv2.approxPolyDP(contour, epsilon=1.5, closed=True)
-                        if len(simplified) < 6 and not cv2.isContourConvex(simplified):
-                            pass   # keep original — avoids self-intersecting paths
-                        else:
+                        if len(simplified) >= 6 or cv2.isContourConvex(simplified):
                             contour = simplified
-                    if len(contour) < 2:
-                        continue
 
                     emb_pts = [px_to_emb(int(p[0][0]), int(p[0][1])) for p in contour]
                     if len(emb_pts) < 2:
                         continue
 
-                    xs_e = [p[0] for p in emb_pts]
-                    ys_e = [p[1] for p in emb_pts]
                     _, _, c_w_px, c_h_px = cv2.boundingRect(contour)
-                    c_w_mm = px_w_to_mm(c_w_px)
-
-                    # Min-shape filter: skip noise shapes below 0.8 mm on either side
                     c_w_emb = c_w_px * scale
                     c_h_emb = c_h_px * scale
                     if c_w_emb < MIN_SHAPE_U or c_h_emb < MIN_SHAPE_U:
                         continue
 
-                    # ── Brightness-based fill / outline decision ──────────────
-                    # Uses the cluster's average RGB brightness to universally
-                    # classify every shape without logo-specific tuning:
-                    #
-                    #   brightness < 80   → dark (black, navy, dark brown)
-                    #                       ALWAYS outline — dark colors in logos
-                    #                       are outlines, never solid fills
-                    #
-                    #   brightness > 200  → very light (white, cream, ivory)
-                    #                       SKIP — already in skip_clusters;
-                    #                       guard here for safety
-                    #
-                    #   brightness 80–200 → mid-tone (red, blue, green, gray)
-                    #                       measure fill_density; > 0.75 → fill
-                    #
-                    # This works universally: black outlines → always outline;
-                    # red/colored fills → fill when solid; cream/white → skipped.
-                    brightness = (rgb[0] + rgb[1] + rgb[2]) / 3
+                    c_w_mm = c_w_emb / 10.0
+                    c_h_mm = c_h_emb / 10.0
 
-                    if brightness < 80:
-                        fill_density = 0.0
-                        is_hollow    = True
-                        _fill_rule   = "dark→outline"
-                    elif brightness > 200:
-                        continue   # safety guard — should be in skip_clusters
-                    else:
-                        c_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-                        cv2.drawContours(c_mask, [contour], -1, 255, thickness=cv2.FILLED)
-                        contour_px_area = int(np.count_nonzero(c_mask))
-                        if contour_px_area > 0:
-                            inside_px    = int(np.count_nonzero(cv2.bitwise_and(c_mask, cluster_px_mask)))
-                            fill_density = inside_px / contour_px_area
-                        else:
-                            fill_density = 1.0
-                        is_hollow  = fill_density <= 0.75
-                        _fill_rule = f"mid fd={fill_density:.2f}→{'outline' if is_hollow else 'fill'}"
+                    # Thin-text detection: bbox < 4mm in either dimension → finer spacing
+                    is_thin          = c_w_mm < 4.0 or c_h_mm < 4.0
+                    outline_stitch_u = STITCH_1_5MM if is_thin else STITCH_2MM
+
+                    # Appliqué detection: large hollow shape (> 40mm × 40mm, fd < 0.3)
+                    is_applique = (
+                        applique_mode
+                        and fill_density < 0.3
+                        and c_w_mm > 40.0
+                        and c_h_mm > 40.0
+                    )
 
                     print(
-                        f"DIGITIZE: contour {c_w_emb/10:.1f}×{c_h_emb/10:.1f}mm "
-                        f"bright={brightness:.0f} {_fill_rule}",
+                        f"DIGITIZE: contour {c_w_mm:.1f}×{c_h_mm:.1f}mm "
+                        f"bright={info['brightness']:.0f} fd={fill_density:.2f} type={stitch_t}",
                         flush=True,
                     )
 
                     start = emb_pts[0]
                     end   = emb_pts[-1]
 
-                    c_h_mm = px_w_to_mm(c_h_px)
-
-                    # ── Thin-text detection ────────────────────────────────────
-                    # Contours where bbox is narrower than 4mm in either dimension
-                    # are thin text strokes.  Use finer 1.5mm stitch spacing so
-                    # the letters look defined rather than gappy.
-                    is_thin = c_w_mm < 4.0 or c_h_mm < 4.0
-
-                    # ── Appliqué detection ─────────────────────────────────────
-                    # A large (>40mm × >40mm) hollow contour (fill_density < 0.3)
-                    # is treated as an appliqué placement when applique_mode=True.
-                    is_applique_candidate = (
-                        applique_mode
-                        and is_hollow
-                        and c_w_mm > 40.0
-                        and c_h_mm > 40.0
-                        and fill_density < 0.3
-                    )
-
-                    # ── Stitch routing ─────────────────────────────────────────
-                    outline_stitch_u = STITCH_1_5MM if is_thin else STITCH_2MM
-
-                    if is_applique_candidate:
-                        # 3-pass appliqué treatment:
-                        # Pass 1 — placement line along contour path
+                    if is_applique:
+                        # 3-pass appliqué: placement line → tack-down (2mm inset) → border
                         pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
                         tie_on(pat, start[0], start[1])
                         running_outline(pat, contour, stitch_u=STITCH_2MM)
                         tie_off(pat, end[0], end[1])
-                        # Pass 2 — tack-down 2mm inside the contour
-                        # Build an inward-offset approximation by shrinking the
-                        # bbox centre-ward by 20 units (2mm) using erode on a mask.
-                        _ap_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-                        cv2.drawContours(_ap_mask, [contour], -1, 255, thickness=cv2.FILLED)
+                        # Pass 2: erode mask by 2mm to get inner tack-down contour
+                        _ap_mask = np.zeros((img_h, img_w), np.uint8)
+                        cv2.drawContours(_ap_mask, [contour], -1, 255, cv2.FILLED)
                         _kern_td = cv2.getStructuringElement(
                             cv2.MORPH_ELLIPSE,
                             (max(1, int(20 / scale)), max(1, int(20 / scale)))
                         )
                         _inner = cv2.erode(_ap_mask, _kern_td, iterations=1)
-                        _inner_cnts, _ = cv2.findContours(_inner, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        if _inner_cnts:
-                            _td = max(_inner_cnts, key=cv2.contourArea)
+                        _ic, _ = cv2.findContours(_inner, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                        if _ic:
+                            _td     = max(_ic, key=cv2.contourArea)
                             _td_pts = [px_to_emb(int(p[0][0]), int(p[0][1])) for p in _td]
                             if len(_td_pts) >= 2:
                                 pat.add_stitch_absolute(pyembroidery.TRIM, _td_pts[0][0], _td_pts[0][1])
                                 tie_on(pat, _td_pts[0][0], _td_pts[0][1])
                                 running_outline(pat, _td, stitch_u=STITCH_2MM)
                                 tie_off(pat, _td_pts[-1][0], _td_pts[-1][1])
-                        # Pass 3 — satin border along the original contour edge
+                        # Pass 3: satin border along original contour
                         pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
                         tie_on(pat, start[0], start[1])
-                        satin_along_path(pat, contour, cluster_px_mask, stitch_u=STITCH_2MM)
+                        running_outline(pat, contour, stitch_u=STITCH_2MM)
                         tie_off(pat, end[0], end[1])
-                        print(
-                            f"DIGITIZE: appliqué 3-pass {c_w_mm:.1f}×{c_h_mm:.1f}mm fd={fill_density:.2f}",
-                            flush=True,
-                        )
+                        print(f"DIGITIZE: appliqué 3-pass {c_w_mm:.1f}×{c_h_mm:.1f}mm", flush=True)
 
-                    elif is_hollow or stitch_type == "running" or (stitch_type == "auto" and c_w_mm < 3.0):
-                        # Hollow / thin: running underlay + satin columns along path
+                    elif stitch_t == "tatami":
+                        # Running underlay + tatami scanline fill
                         pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
                         tie_on(pat, start[0], start[1])
                         running_outline(pat, contour, stitch_u=outline_stitch_u)
                         pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
-                        satin_along_path(pat, contour, cluster_px_mask, stitch_u=outline_stitch_u)
-                        tie_off(pat, end[0], end[1])
-
-                    elif stitch_type == "satin" or (stitch_type == "auto" and c_w_mm < 8.0):
-                        # Medium: running underlay + satin rows
-                        pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
-                        tie_on(pat, start[0], start[1])
-                        running_outline(pat, contour, stitch_u=outline_stitch_u)
-                        pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
-                        satin_fill(pat, contour, xs_e, ys_e, row_u=satin_row_u)
+                        tatami_fill(pat, contour, row_u=tatami_row_u)
                         tie_off(pat, end[0], end[1])
 
                     else:
-                        # Large: running underlay + tatami fill
+                        # Running stitch outline (dark shapes, hollow shapes)
                         pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
                         tie_on(pat, start[0], start[1])
                         running_outline(pat, contour, stitch_u=outline_stitch_u)
-                        pat.add_stitch_absolute(pyembroidery.TRIM, start[0], start[1])
-                        tatami_fill(pat, contour, row_u=tatami_row_u, stitch_u=STITCH_4MM)
                         tie_off(pat, end[0], end[1])
 
                     has_stitches = True
 
             return pat, has_stitches
 
-        # First pass with standard 0.5 mm row spacing
         pattern, any_stitches = _build_pattern()
-
         if not any_stitches:
             return jsonify({"error": "No stitches generated — try a different image"}), 400
 
-        # ── Stitch-density cap: 5,000 stitches ────────────────────────────────
-        # If over the limit, increase row spacing by 20% per pass until the
-        # count drops to ≤ 5,000 or 6 retries are exhausted.
-        # Starting from 5 units (0.5 mm): 5 → 6 → 7 → 9 → 10 → 12 → 15 mm.
-        _row_u     = SATIN_ROW_U   # 5 units = 0.5 mm
-        _MAX_CAP_PASSES = 6
-        for _cap_pass in range(_MAX_CAP_PASSES):
+        # Stitch density cap: max 5,000 stitches; widen tatami rows up to 6 times
+        _row_u = TATAMI_ROW_U
+        for _cap_pass in range(6):
             _sc = sum(1 for s in pattern.stitches if s[2] == pyembroidery.STITCH)
             if _sc <= 5000:
                 break
-            _row_u = max(_row_u + 1, round(_row_u * 1.2))   # +20%, min +1 unit
+            _row_u = max(_row_u + 1, round(_row_u * 1.2))
             print(
                 f"DIGITIZE: density cap — {_sc} > 5000; "
-                f"pass {_cap_pass + 1}/{_MAX_CAP_PASSES} → row_u={_row_u} ({_row_u/10:.1f}mm)",
+                f"pass {_cap_pass + 1}/6 → row_u={_row_u} ({_row_u/10:.1f}mm)",
                 flush=True,
             )
-            pattern, any_stitches = _build_pattern(satin_row_u=_row_u, tatami_row_u=_row_u)
+            pattern, any_stitches = _build_pattern(tatami_row_u=_row_u)
             if not any_stitches:
                 return jsonify({"error": "No stitches generated after density adjustment"}), 400
 
         pattern.add_stitch_absolute(pyembroidery.END, 0, 0)
         pyembroidery.write(pattern, tmp_out.name)
 
-        # ── 9. Verify output ───────────────────────────────────────────────────
+        # ── STEP 7: Verification ───────────────────────────────────────────────
         verify = pyembroidery.read(tmp_out.name)
-        if verify is not None:
-            v_s = [s for s in verify.stitches if s[2] == pyembroidery.STITCH]
-            if v_s:
-                vxs  = [s[0] for s in v_s]; vys = [s[1] for s in v_s]
-                ow   = (max(vxs) - min(vxs)) / 10.0
-                oh   = (max(vys) - min(vys)) / 10.0
-                sc   = len(v_s)
-                print(f"DIGITIZE VERIFY: {sc} stitches  {ow:.1f}mm × {oh:.1f}mm", flush=True)
-                if sc < 500 or sc > 50000:
-                    print(f"DIGITIZE WARN: stitch count {sc} outside 500–50000", flush=True)
-                if not (10 <= ow <= 200 and 10 <= oh <= 200):
-                    print(f"DIGITIZE WARN: dimensions {ow:.1f}×{oh:.1f}mm outside 10–200mm", flush=True)
-                if ow < 1 or oh < 1:
-                    return jsonify({"error": "Scaling error — design produced at incorrect size"}), 500
+        if verify is None:
+            return jsonify({"error": "Could not read back output file"}), 500
 
-        info = get_design_info(pattern)
-        mime = MIME_TYPES.get(output_format, "application/octet-stream")
+        v_s = [s for s in verify.stitches if s[2] == pyembroidery.STITCH]
+        if not v_s:
+            return jsonify({"error": "Output file contains no stitches"}), 400
+
+        vxs = [s[0] for s in v_s];  vys = [s[1] for s in v_s]
+        ow  = (max(vxs) - min(vxs)) / 10.0
+        oh  = (max(vys) - min(vys)) / 10.0
+        sc  = len(v_s)
+        print(f"DIGITIZE VERIFY: {sc} stitches  {ow:.1f}mm × {oh:.1f}mm", flush=True)
+
+        if sc < 100 or sc > 50000:
+            return jsonify({"error": f"Stitch count {sc} is outside valid range 100–50000"}), 400
+        if ow < 5 or oh < 5:
+            return jsonify({"error": f"Design too small: {ow:.1f}×{oh:.1f}mm (minimum 5mm per side)"}), 400
+
+        info_d   = get_design_info(pattern)
+        mime     = MIME_TYPES.get(output_format, "application/octet-stream")
         response = send_file(tmp_out.name, mimetype=mime, as_attachment=True,
                              download_name="digitized" + output_format)
-        response.headers["stitch_count"]   = str(info["stitch_count"])
-        response.headers["color_count"]    = str(info["color_count"])
-        response.headers["width_mm"]       = str(info["width_mm"])
-        response.headers["height_mm"]      = str(info["height_mm"])
-        response.headers["estimated_time"] = str(info["estimated_time_minutes"])
-        print(f"DIGITIZE OK: stitch_count={info['stitch_count']} color_count={info['color_count']} "
-              f"width_mm={info['width_mm']} height_mm={info['height_mm']}", flush=True)
+        response.headers["stitch_count"]   = str(info_d["stitch_count"])
+        response.headers["color_count"]    = str(info_d["color_count"])
+        response.headers["width_mm"]       = str(info_d["width_mm"])
+        response.headers["height_mm"]      = str(info_d["height_mm"])
+        response.headers["estimated_time"] = str(info_d["estimated_time_minutes"])
+        print(
+            f"DIGITIZE OK: stitch_count={info_d['stitch_count']} color_count={info_d['color_count']}"
+            f" width_mm={info_d['width_mm']} height_mm={info_d['height_mm']}",
+            flush=True,
+        )
         return response
+
     except Exception as e:
         error_details = traceback.format_exc()
         print(f"DIGITIZE ERROR: {error_details}", flush=True)
