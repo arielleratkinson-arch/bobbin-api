@@ -341,7 +341,7 @@ def get_design_info(pattern):
     threads = pattern.threadlist if pattern.threadlist else []
 
     for stitch in pattern.stitches:
-        cmd = stitch[2] & 0xF0
+        cmd = stitch[2]
         if cmd == pyembroidery.STITCH:
             stitch_count += 1
             current_color_stitch_count += 1
@@ -381,8 +381,8 @@ def get_design_info(pattern):
         thread_colors.append("#{:02X}{:02X}{:02X}".format(
             (c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF))
 
-    xs = [s[0] for s in pattern.stitches if (s[2] & 0xF0) in (pyembroidery.STITCH, pyembroidery.JUMP)]
-    ys = [s[1] for s in pattern.stitches if (s[2] & 0xF0) in (pyembroidery.STITCH, pyembroidery.JUMP)]
+    xs = [s[0] for s in pattern.stitches if s[2] in (pyembroidery.STITCH, pyembroidery.JUMP)]
+    ys = [s[1] for s in pattern.stitches if s[2] in (pyembroidery.STITCH, pyembroidery.JUMP)]
 
     if xs and ys:
         width_mm = (max(xs) - min(xs)) / 10.0
@@ -1321,8 +1321,8 @@ def preview():
         if pattern is None:
             return jsonify({"error": "Could not read embroidery file"}), 400
 
-        xs = [s[0] for s in pattern.stitches if (s[2] & 0xF0) in (pyembroidery.STITCH, pyembroidery.JUMP)]
-        ys = [s[1] for s in pattern.stitches if (s[2] & 0xF0) in (pyembroidery.STITCH, pyembroidery.JUMP)]
+        xs = [s[0] for s in pattern.stitches if s[2] in (pyembroidery.STITCH, pyembroidery.JUMP)]
+        ys = [s[1] for s in pattern.stitches if s[2] in (pyembroidery.STITCH, pyembroidery.JUMP)]
 
         if not xs or not ys:
             img = Image.new("RGB", (200, 200), "white")
@@ -1418,8 +1418,8 @@ def split():
             return jsonify({"error": "Could not read embroidery file"}), 400
 
         stitches = pattern.stitches
-        xs = [s[0] for s in stitches if (s[2] & 0xF0) in (pyembroidery.STITCH, pyembroidery.JUMP)]
-        ys = [s[1] for s in stitches if (s[2] & 0xF0) in (pyembroidery.STITCH, pyembroidery.JUMP)]
+        xs = [s[0] for s in stitches if s[2] in (pyembroidery.STITCH, pyembroidery.JUMP)]
+        ys = [s[1] for s in stitches if s[2] in (pyembroidery.STITCH, pyembroidery.JUMP)]
 
         if not xs or not ys:
             return jsonify({"error": "Design has no stitches"}), 400
@@ -1449,7 +1449,7 @@ def split():
 
                 has_stitches = False
                 for stitch in stitches:
-                    x, y, cmd = stitch[0], stitch[1], stitch[2] & 0xF0
+                    x, y, cmd = stitch[0], stitch[1], stitch[2]
                     if cmd in (pyembroidery.STITCH, pyembroidery.JUMP):
                         if sect_min_x <= x <= sect_max_x and sect_min_y <= y <= sect_max_y:
                             nx = int(x - sect_min_x)
@@ -1567,8 +1567,8 @@ def resize():
         if pattern is None:
             return jsonify({"error": "Could not read embroidery file"}), 400
 
-        xs = [s[0] for s in pattern.stitches if (s[2] & 0xF0) in (pyembroidery.STITCH, pyembroidery.JUMP)]
-        ys = [s[1] for s in pattern.stitches if (s[2] & 0xF0) in (pyembroidery.STITCH, pyembroidery.JUMP)]
+        xs = [s[0] for s in pattern.stitches if s[2] in (pyembroidery.STITCH, pyembroidery.JUMP)]
+        ys = [s[1] for s in pattern.stitches if s[2] in (pyembroidery.STITCH, pyembroidery.JUMP)]
 
         if not xs or not ys:
             return jsonify({"error": "Design has no stitches"}), 400
@@ -1592,7 +1592,7 @@ def resize():
 
         for stitch in pattern.stitches:
             x, y, cmd = stitch[0], stitch[1], stitch[2]
-            new_pattern.add_stitch_absolute(cmd & 0xF0, int(x * scale_x), int(y * scale_y))
+            new_pattern.add_stitch_absolute(cmd, int(x * scale_x), int(y * scale_y))
 
         pyembroidery.write(new_pattern, tmp_out.name)
 
@@ -1658,7 +1658,7 @@ def rotate():
             x, y, cmd = stitch[0], stitch[1], stitch[2]
             nx = int(x * cos_a - y * sin_a)
             ny = int(x * sin_a + y * cos_a)
-            new_pattern.add_stitch_absolute(cmd & 0xF0, nx, ny)
+            new_pattern.add_stitch_absolute(cmd, nx, ny)
 
         pyembroidery.write(new_pattern, tmp_out.name)
 
@@ -1720,8 +1720,8 @@ def merge():
             patterns.append(p)
 
         def get_bounds(p):
-            xs = [s[0] for s in p.stitches if (s[2] & 0xF0) in (pyembroidery.STITCH, pyembroidery.JUMP)]
-            ys = [s[1] for s in p.stitches if (s[2] & 0xF0) in (pyembroidery.STITCH, pyembroidery.JUMP)]
+            xs = [s[0] for s in p.stitches if s[2] in (pyembroidery.STITCH, pyembroidery.JUMP)]
+            ys = [s[1] for s in p.stitches if s[2] in (pyembroidery.STITCH, pyembroidery.JUMP)]
             if not xs:
                 return 0, 0, 0, 0
             return min(xs), min(ys), max(xs), max(ys)
@@ -1753,7 +1753,7 @@ def merge():
 
             first = True
             for stitch in p.stitches:
-                x, y, cmd = stitch[0], stitch[1], stitch[2] & 0xF0
+                x, y, cmd = stitch[0], stitch[1], stitch[2]
                 if cmd == pyembroidery.END:
                     break
                 nx, ny = x + ox, y + oy
