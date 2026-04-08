@@ -578,10 +578,10 @@ def digitize():
             pil_img = pil_img.convert("RGB")
 
         # ── STEP 2: Preprocessing ──────────────────────────────────────────────
-        # Resize to max 500×500 preserving aspect ratio; white-pad to exact square
-        MAX_DIM = 500
+        # Resize to max 1000px on longest side preserving aspect ratio; white-pad if needed
+        MAX_DIM = 1000
         orig_w, orig_h = pil_img.size
-        if orig_w > MAX_DIM or orig_h > MAX_DIM:
+        if max(orig_w, orig_h) > MAX_DIM:
             ratio   = min(MAX_DIM / orig_w, MAX_DIM / orig_h)
             new_w   = max(1, int(orig_w * ratio))
             new_h   = max(1, int(orig_h * ratio))
@@ -665,7 +665,7 @@ def digitize():
             cluster_mask  = (labels_2d == cidx).astype(np.uint8) * 255
             contours_info = []
             for contour in raw_contours:
-                if cv2.contourArea(contour) < 50:
+                if cv2.contourArea(contour) < 15:
                     continue
                 c_mask = np.zeros((img_h, img_w), np.uint8)
                 cv2.drawContours(c_mask, [contour], -1, 255, cv2.FILLED)
@@ -677,11 +677,11 @@ def digitize():
                 else:
                     fill_density = 1.0
 
-                # Stitch type per spec:
-                #   brightness < 80  → ALWAYS running stitch (dark outlines)
-                #   fill_density > 0.75 → tatami fill (solid colored shapes)
+                # Stitch type:
+                #   brightness < 60  → ALWAYS running stitch (black, very dark colors)
+                #   fill_density > 0.75 → tatami fill (solid colored shapes, incl. dark red)
                 #   otherwise → running stitch outline
-                if brightness < 80:
+                if brightness < 60:
                     stitch_t = "running"
                 elif fill_density > 0.75:
                     stitch_t = "tatami"
