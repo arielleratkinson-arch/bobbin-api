@@ -1,2 +1,2 @@
-[phases.install]
-aptPkgs = ["potrace"]
+[phases.setup]
+nixPkgs = ["python311", "potrace"]
