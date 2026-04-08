@@ -88,6 +88,18 @@ def _potrace_env():
     return env
 
 
+# ── Module-load potrace availability check ────────────────────────────────────
+try:
+    _pt_check = subprocess.run(["potrace", "--version"], capture_output=True, timeout=5)
+    _POTRACE_ON_PATH = _pt_check.returncode == 0
+except Exception:
+    _POTRACE_ON_PATH = False
+print(
+    f"STARTUP: potrace on PATH={_POTRACE_ON_PATH}  "
+    f"local_bin={POTRACE_BIN!r}  available={_potrace_available()}",
+    flush=True,
+)
+
 # Pre-compute potrace environment once at module load (avoids ldd overhead per request)
 _POTRACE_ENV: dict = {}
 
@@ -659,8 +671,22 @@ def digitize():
                 if raw_contours is not None:
                     vectorized_cidxs.add(cidx)
             if raw_contours is None:
-                raw_c, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                raw_contours = list(raw_c)
+                # Canny-based fallback: smoother outlines than raw cv2.findContours
+                edges  = cv2.Canny(mask, 50, 150)
+                raw_c, _ = cv2.findContours(
+                    edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_TC89_KCOS
+                )
+                smoothed = []
+                for _c in raw_c:
+                    arc = cv2.arcLength(_c, closed=True)
+                    eps = 0.005 * arc   # 0.5% of arc length
+                    smoothed.append(cv2.approxPolyDP(_c, epsilon=eps, closed=True))
+                raw_contours = smoothed
+                print(
+                    f"VECTORIZE: potrace unavailable for cidx={cidx}; "
+                    f"Canny fallback → {len(smoothed)} contour(s)",
+                    flush=True,
+                )
 
             cluster_mask  = (labels_2d == cidx).astype(np.uint8) * 255
             contours_info = []
@@ -1040,6 +1066,14 @@ def preview():
                     c = getattr(t, 'color', 0x000000)
                     return ((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)
                 return (0, 0, 0)
+
+            # Debug: confirm raw integer values pyembroidery uses for each command
+            print(
+                f"PREVIEW: cmd constants — STITCH={pyembroidery.STITCH} "
+                f"JUMP={pyembroidery.JUMP} TRIM={pyembroidery.TRIM} "
+                f"COLOR_CHANGE={pyembroidery.COLOR_CHANGE} END={pyembroidery.END}",
+                flush=True,
+            )
 
             color_idx = 0
             prev_pt = None
