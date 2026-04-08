@@ -623,25 +623,51 @@ def digitize():
         print(f"DIGITIZE: clean_frac={_clean_frac:.2f}  is_clean={_is_clean}", flush=True)
 
         if _is_clean:
-            # Clean vector image — go straight to K-means, no blurring
+            # Clean vector image — go straight to color separation, no blurring
             img_filtered = img_rgb
+            # Re-resize clean images to 500px for sharper color separation
+            if max(img_rgb.shape[:2]) > 500:
+                _ratio = 500 / max(img_rgb.shape[:2])
+                _nw = max(1, int(img_w * _ratio))
+                _nh = max(1, int(img_h * _ratio))
+                img_rgb      = cv2.resize(img_rgb, (_nw, _nh), interpolation=cv2.INTER_AREA)
+                img_h, img_w = img_rgb.shape[:2]
+                img_filtered = img_rgb
+                print(f"DIGITIZE: clean image resized to {_nw}×{_nh}px", flush=True)
         else:
             # Complex raster — unsharp mask then bilateral smooth
             _blurred     = cv2.GaussianBlur(img_rgb, (0, 0), 3)
             img_sharp    = cv2.addWeighted(img_rgb, 1.5, _blurred, -0.5, 0)
             img_filtered = cv2.bilateralFilter(img_sharp, d=5, sigmaColor=100, sigmaSpace=100)
 
-        # ── STEP 3: Color Clustering ───────────────────────────────────────────
-        # Clean images use k=6: enough to separate bg, outlines, fill colors, text.
-        # Complex images respect the caller's color_count_param.
-        k         = 6 if _is_clean else min(16, max(2, color_count_param))
-        pixels    = np.float32(img_filtered.reshape(-1, 3))
-        criteria  = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0)
-        _, labels_flat, centers = cv2.kmeans(
-            pixels, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS
-        )
-        centers   = np.uint8(centers)
-        labels_2d = labels_flat.flatten().reshape(img_h, img_w)
+        # ── STEP 3: Color Separation ───────────────────────────────────────────
+        if _is_clean:
+            # Clean vector image: find distinct colors directly instead of K-means
+            # Quantize to 16 colors using PIL median cut, then find unique clusters
+            pil_q        = Image.fromarray(img_filtered).quantize(colors=16, method=Image.Quantize.MEDIANCUT).convert("RGB")
+            img_q        = np.array(pil_q, dtype=np.uint8)
+            pixels_flat  = img_q.reshape(-1, 3)
+            unique_colors, counts = np.unique(pixels_flat, axis=0, return_counts=True)
+            sort_idx     = np.argsort(-counts)
+            unique_colors = unique_colors[sort_idx]
+            k            = min(len(unique_colors), 16)
+            centers      = unique_colors[:k].astype(np.uint8)
+            labels_2d    = np.zeros((img_h, img_w), dtype=np.int32)
+            for _ci, _color in enumerate(centers):
+                _mask_c = np.all(img_q == _color, axis=2)
+                labels_2d[_mask_c] = _ci
+            print(f"DIGITIZE: clean image — direct color separation k={k}", flush=True)
+        else:
+            # Complex raster — use K-means as before
+            k        = min(16, max(2, color_count_param))
+            pixels   = np.float32(img_filtered.reshape(-1, 3))
+            criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0)
+            _, labels_flat, centers = cv2.kmeans(
+                pixels, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS
+            )
+            centers   = np.uint8(centers)
+            labels_2d = labels_flat.flatten().reshape(img_h, img_w)
+            print(f"DIGITIZE: complex image — K-means k={k}", flush=True)
 
         # Background: brightness > 200 OR appears in > 30% of edge pixels
         from collections import Counter as _Counter
@@ -659,10 +685,8 @@ def digitize():
         _light_bg    = {
             c for c in range(k)
             if (
-                # near-white: average brightness > 230
-                (int(centers[c][0]) + int(centers[c][1]) + int(centers[c][2])) / 3 > 230
-                # cream / beige (paper / parchment tones) — not a stitch color
-                or (int(centers[c][0]) > 220 and int(centers[c][1]) > 200 and int(centers[c][2]) > 180)
+                (int(centers[c][0]) + int(centers[c][1]) + int(centers[c][2])) / 3 > 220
+                or (int(centers[c][0]) > 210 and int(centers[c][1]) > 195 and int(centers[c][2]) > 175)
             )
         }
         bg_clusters = _edge_bg | _light_bg
@@ -734,14 +758,16 @@ def digitize():
                 else:
                     fill_density = 1.0
 
-                # Stitch type — solidity-based fill detection:
-                #   solidity = contour_area / convex_hull_area (shape compactness 0–1)
-                #   High solidity + high fill_density + non-white → solid filled shape → tatami
-                #   Otherwise → running stitch outline
-                _hull     = cv2.convexHull(contour)
-                _hull_a   = cv2.contourArea(_hull)
-                solidity  = cv2.contourArea(contour) / _hull_a if _hull_a > 0 else 0.0
-                if solidity > 0.75 and fill_density > 0.65 and brightness < 180:
+                # Stitch type — solidity + size based fill detection
+                _hull      = cv2.convexHull(contour)
+                _hull_a    = cv2.contourArea(_hull)
+                solidity   = cv2.contourArea(contour) / _hull_a if _hull_a > 0 else 0.0
+                c_area_px  = cv2.contourArea(contour)
+                # Small solid shapes (hearts, dots): area < 2000px, high fill density
+                is_small_solid = c_area_px < 2000 and fill_density > 0.55
+                # Large solid shapes: high solidity and fill density
+                is_large_solid = solidity > 0.75 and fill_density > 0.65 and brightness < 180
+                if (is_small_solid or is_large_solid) and brightness < 190:
                     stitch_t = "tatami"
                 else:
                     stitch_t = "running"
