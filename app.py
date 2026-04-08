@@ -1616,6 +1616,14 @@ def regions():
                 stitch_type = "tatami" if (is_small_solid or is_large_solid) and brightness < 190 else "running"
 
                 hex_color = "#{:02X}{:02X}{:02X}".format(*rgb)
+                # Simplify contour to max 32 points for frontend rendering
+                simplified = cv2.approxPolyDP(
+                    contour,
+                    epsilon=0.02 * cv2.arcLength(contour, True),
+                    closed=True
+                )
+                polygon = [[int(p[0][0]), int(p[0][1])] for p in simplified]
+
                 region_list.append({
                     "id": f"region_{cidx}_{len(region_list)}",
                     "color": hex_color,
@@ -1625,6 +1633,7 @@ def regions():
                     "fill_density": round(fill_density, 2),
                     "solidity": round(solidity, 2),
                     "bbox": {"x": x, "y": y, "w": w, "h": h},
+                    "polygon": polygon,
                     "area_px": round(area, 1),
                     "is_background": False,
                 })
