@@ -1507,7 +1507,140 @@ def merge():
             _cleanup(tf)
 
 
-# ─── ERROR HANDLERS ──────────────────────────────────────────────────────────
+# ─── REGIONS ─────────────────────────────────────────────────────────────────
+
+@bp.route("/regions", methods=["POST"])
+def regions():
+    """Analyse an image and return detected color regions as JSON.
+    Used by the frontend editor so users can click regions and adjust settings
+    before re-digitizing."""
+    if cv2 is None or Image is None or np is None:
+        return jsonify({"error": "OpenCV/Pillow not installed"}), 500
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+
+    allowed_image_ext = [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif"]
+    tmp_in, in_ext, err = read_uploaded_file(request.files["file"], allowed_image_ext)
+    if err:
+        return jsonify({"error": err}), 400
+
+    try:
+        pil_img = Image.open(tmp_in)
+        if pil_img.mode in ("RGBA", "LA", "PA"):
+            if pil_img.mode == "PA":
+                pil_img = pil_img.convert("RGBA")
+            bg = Image.new("RGB", pil_img.size, (255, 255, 255))
+            bg.paste(pil_img, mask=pil_img.split()[-1])
+            pil_img = bg
+        else:
+            pil_img = pil_img.convert("RGB")
+
+        # Resize to 500px max
+        MAX_DIM = 500
+        orig_w, orig_h = pil_img.size
+        if max(orig_w, orig_h) > MAX_DIM:
+            ratio = min(MAX_DIM / orig_w, MAX_DIM / orig_h)
+            pil_img = pil_img.resize(
+                (max(1, int(orig_w * ratio)), max(1, int(orig_h * ratio))),
+                Image.LANCZOS
+            )
+
+        img_rgb = np.array(pil_img, dtype=np.uint8)
+        img_h, img_w = img_rgb.shape[:2]
+
+        # K-means clustering
+        k = 8
+        pixels = np.float32(img_rgb.reshape(-1, 3))
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0)
+        _, labels_flat, centers = cv2.kmeans(
+            pixels, k, None, criteria, 10, cv2.KMEANS_PP_CENTERS
+        )
+        centers = np.uint8(centers)
+        labels_2d = labels_flat.flatten().reshape(img_h, img_w)
+
+        # Detect background clusters
+        from collections import Counter as _Counter
+        _n = 20
+        _edge_s = []
+        for _i in range(_n):
+            _tx = int(_i * (img_w - 1) / max(_n - 1, 1))
+            _edge_s += [int(labels_2d[0, _tx]), int(labels_2d[img_h-1, _tx])]
+        for _i in range(_n):
+            _ty = int(_i * (img_h - 1) / max(_n - 1, 1))
+            _edge_s += [int(labels_2d[_ty, 0]), int(labels_2d[_ty, img_w-1])]
+        _edge_counts = _Counter(_edge_s)
+        _edge_bg = {c for c, cnt in _edge_counts.items() if cnt / len(_edge_s) >= 0.30}
+        _light_bg = {
+            c for c in range(k)
+            if (int(centers[c][0]) + int(centers[c][1]) + int(centers[c][2])) / 3 > 220
+            or (int(centers[c][0]) > 210 and int(centers[c][1]) > 195 and int(centers[c][2]) > 175)
+        }
+        bg_clusters = _edge_bg | _light_bg
+
+        # Build region list
+        region_list = []
+        for cidx in range(k):
+            if cidx in bg_clusters:
+                continue
+            rgb = tuple(int(x) for x in centers[cidx])
+            brightness = (rgb[0] + rgb[1] + rgb[2]) / 3.0
+            if brightness > 200:
+                continue
+
+            mask = ((labels_2d == cidx).astype(np.uint8) * 255)
+            k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k3)
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < 15:
+                    continue
+                x, y, w, h = cv2.boundingRect(contour)
+                hull = cv2.convexHull(contour)
+                hull_a = cv2.contourArea(hull)
+                solidity = area / hull_a if hull_a > 0 else 0.0
+
+                c_mask = np.zeros((img_h, img_w), np.uint8)
+                cv2.drawContours(c_mask, [contour], -1, 255, cv2.FILLED)
+                cluster_mask = (labels_2d == cidx).astype(np.uint8) * 255
+                c_area = int(np.count_nonzero(c_mask))
+                fill_density = (
+                    int(np.count_nonzero(cv2.bitwise_and(c_mask, cluster_mask))) / c_area
+                    if c_area > 0 else 1.0
+                )
+
+                # Auto-detect stitch type
+                is_small_solid = area < 2000 and fill_density > 0.55
+                is_large_solid = solidity > 0.75 and fill_density > 0.65 and brightness < 180
+                stitch_type = "tatami" if (is_small_solid or is_large_solid) and brightness < 190 else "running"
+
+                hex_color = "#{:02X}{:02X}{:02X}".format(*rgb)
+                region_list.append({
+                    "id": f"region_{cidx}_{len(region_list)}",
+                    "color": hex_color,
+                    "rgb": list(rgb),
+                    "brightness": round(brightness, 1),
+                    "stitch_type": stitch_type,
+                    "fill_density": round(fill_density, 2),
+                    "solidity": round(solidity, 2),
+                    "bbox": {"x": x, "y": y, "w": w, "h": h},
+                    "area_px": round(area, 1),
+                    "is_background": False,
+                })
+
+        return jsonify({
+            "regions": region_list,
+            "image_width": img_w,
+            "image_height": img_h,
+            "total_regions": len(region_list),
+        })
+
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+    finally:
+        _cleanup(tmp_in)# ─── ERROR HANDLERS ──────────────────────────────────────────────────────────
 
 @app.errorhandler(413)
 def too_large(e):
