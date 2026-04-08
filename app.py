@@ -691,7 +691,8 @@ def digitize():
             cluster_mask  = (labels_2d == cidx).astype(np.uint8) * 255
             contours_info = []
             for contour in raw_contours:
-                if cv2.contourArea(contour) < 15:
+                # Filter noise: skip tiny fragments by area OR arc length
+                if cv2.contourArea(contour) < 50 or cv2.arcLength(contour, closed=True) < 20:
                     continue
                 c_mask = np.zeros((img_h, img_w), np.uint8)
                 cv2.drawContours(c_mask, [contour], -1, 255, cv2.FILLED)
@@ -704,10 +705,15 @@ def digitize():
                     fill_density = 1.0
 
                 # Stitch type:
-                #   brightness < 60  → ALWAYS running stitch (black, very dark colors)
-                #   fill_density > 0.75 → tatami fill (solid colored shapes, incl. dark red)
+                #   Small solid shape (bbox < 30×30px AND fd > 0.5) → tatami fill
+                #     regardless of brightness (e.g. small hearts, dots, icons)
+                #   brightness < 60  → ALWAYS running stitch (black / near-black)
+                #   fill_density > 0.75 → tatami fill (solid mid-tone shapes)
                 #   otherwise → running stitch outline
-                if brightness < 60:
+                _, _, _bw, _bh = cv2.boundingRect(contour)
+                if _bw < 30 and _bh < 30 and fill_density > 0.5:
+                    stitch_t = "tatami"
+                elif brightness < 60:
                     stitch_t = "running"
                 elif fill_density > 0.75:
                     stitch_t = "tatami"
