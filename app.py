@@ -605,15 +605,36 @@ def digitize():
         img_rgb      = np.array(pil_img, dtype=np.uint8)
         img_h, img_w = img_rgb.shape[:2]
 
-        # Unsharp mask — enhance edges before clustering so text/outlines survive K-means
-        _blurred     = cv2.GaussianBlur(img_rgb, (0, 0), 3)
-        img_sharp    = cv2.addWeighted(img_rgb, 1.5, _blurred, -0.5, 0)
+        # ── Detect "clean" vector-style images ────────────────────────────────
+        # A clean image has mostly near-white, near-black, or saturated pixels.
+        # If ≥60% of non-white pixels are near-black or highly saturated, skip
+        # all blurring/sharpening — filtering only hurts clean vector art.
+        _pix_flat   = img_rgb.reshape(-1, 3).astype(np.int32)
+        _near_white = np.all(_pix_flat > 220, axis=1)
+        _non_white  = _pix_flat[~_near_white]
+        if len(_non_white) > 0:
+            _near_black = np.all(_non_white < 50, axis=1)
+            _ch_range   = _non_white.max(axis=1) - _non_white.min(axis=1)
+            _saturated  = _ch_range > 80
+            _clean_frac = float((_near_black | _saturated).sum()) / len(_non_white)
+        else:
+            _clean_frac = 1.0
+        _is_clean = _clean_frac >= 0.60
+        print(f"DIGITIZE: clean_frac={_clean_frac:.2f}  is_clean={_is_clean}", flush=True)
 
-        # Bilateral filter — d=5 preserves fine stripe / line details better than d=9
-        img_filtered = cv2.bilateralFilter(img_sharp, d=5, sigmaColor=100, sigmaSpace=100)
+        if _is_clean:
+            # Clean vector image — go straight to K-means, no blurring
+            img_filtered = img_rgb
+        else:
+            # Complex raster — unsharp mask then bilateral smooth
+            _blurred     = cv2.GaussianBlur(img_rgb, (0, 0), 3)
+            img_sharp    = cv2.addWeighted(img_rgb, 1.5, _blurred, -0.5, 0)
+            img_filtered = cv2.bilateralFilter(img_sharp, d=5, sigmaColor=100, sigmaSpace=100)
 
         # ── STEP 3: Color Clustering ───────────────────────────────────────────
-        k         = min(16, max(2, color_count_param))
+        # Clean images use k=6: enough to separate bg, outlines, fill colors, text.
+        # Complex images respect the caller's color_count_param.
+        k         = 6 if _is_clean else min(16, max(2, color_count_param))
         pixels    = np.float32(img_filtered.reshape(-1, 3))
         criteria  = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 1.0)
         _, labels_flat, centers = cv2.kmeans(
@@ -637,7 +658,12 @@ def digitize():
         _edge_bg     = {c for c, cnt in _edge_counts.items() if cnt / _edge_total >= 0.30}
         _light_bg    = {
             c for c in range(k)
-            if (int(centers[c][0]) + int(centers[c][1]) + int(centers[c][2])) / 3 > 200
+            if (
+                # near-white: average brightness > 230
+                (int(centers[c][0]) + int(centers[c][1]) + int(centers[c][2])) / 3 > 230
+                # cream / beige (paper / parchment tones) — not a stitch color
+                or (int(centers[c][0]) > 220 and int(centers[c][1]) > 200 and int(centers[c][2]) > 180)
+            )
         }
         bg_clusters = _edge_bg | _light_bg
         print(f"DIGITIZE: k={k}  bg_clusters={bg_clusters}  image={img_w}×{img_h}px", flush=True)
