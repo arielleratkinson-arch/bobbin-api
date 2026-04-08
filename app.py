@@ -605,8 +605,12 @@ def digitize():
         img_rgb      = np.array(pil_img, dtype=np.uint8)
         img_h, img_w = img_rgb.shape[:2]
 
+        # Unsharp mask — enhance edges before clustering so text/outlines survive K-means
+        _blurred     = cv2.GaussianBlur(img_rgb, (0, 0), 3)
+        img_sharp    = cv2.addWeighted(img_rgb, 1.5, _blurred, -0.5, 0)
+
         # Bilateral filter — d=5 preserves fine stripe / line details better than d=9
-        img_filtered = cv2.bilateralFilter(img_rgb, d=5, sigmaColor=100, sigmaSpace=100)
+        img_filtered = cv2.bilateralFilter(img_sharp, d=5, sigmaColor=100, sigmaSpace=100)
 
         # ── STEP 3: Color Clustering ───────────────────────────────────────────
         k         = min(16, max(2, color_count_param))
@@ -704,13 +708,14 @@ def digitize():
                 else:
                     fill_density = 1.0
 
-                # Stitch type:
-                #   brightness < 60  → ALWAYS running stitch (black / near-black)
-                #   fill_density > 0.75 → tatami fill (solid colored shapes)
-                #   otherwise → running stitch outline
-                if brightness < 60:
-                    stitch_t = "running"
-                elif fill_density > 0.75:
+                # Stitch type — solidity-based fill detection:
+                #   solidity = contour_area / convex_hull_area (shape compactness 0–1)
+                #   High solidity + high fill_density + non-white → solid filled shape → tatami
+                #   Otherwise → running stitch outline
+                _hull     = cv2.convexHull(contour)
+                _hull_a   = cv2.contourArea(_hull)
+                solidity  = cv2.contourArea(contour) / _hull_a if _hull_a > 0 else 0.0
+                if solidity > 0.75 and fill_density > 0.65 and brightness < 180:
                     stitch_t = "tatami"
                 else:
                     stitch_t = "running"
